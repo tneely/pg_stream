@@ -5,9 +5,6 @@ use std::{
 
 use bytes::{BufMut, Bytes, BytesMut};
 
-#[cfg(feature = "tokio")]
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
 use crate::PgStream;
 use crate::frontend;
 
@@ -20,7 +17,7 @@ const CURRENT_VERSION: ProtocolVersion = ProtocolVersion::new(3, 0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(transparent)]
-struct ProtocolVersion(u32);
+pub struct ProtocolVersion(u32);
 
 impl ProtocolVersion {
     const fn new(major: u16, minor: u16) -> Self {
@@ -45,6 +42,18 @@ impl From<u32> for ProtocolVersion {
 impl From<ProtocolVersion> for u32 {
     fn from(value: ProtocolVersion) -> Self {
         value.0
+    }
+}
+
+impl PartialEq<u32> for ProtocolVersion {
+    fn eq(&self, other: &u32) -> bool {
+        self.0 == *other
+    }
+}
+
+impl PartialEq<ProtocolVersion> for u32 {
+    fn eq(&self, other: &ProtocolVersion) -> bool {
+        *self == other.0
     }
 }
 
@@ -93,8 +102,8 @@ impl ConnectionBuilder {
         self
     }
 
-    pub fn protocol(mut self, protocol: ProtocolVersion) -> Self {
-        self.protocol = protocol;
+    pub fn protocol(mut self, protocol: impl Into<ProtocolVersion>) -> Self {
+        self.protocol = protocol.into();
         self
     }
 
@@ -126,13 +135,14 @@ impl ConnectionBuilder {
 }
 
 pub trait Connect<S> {
-    // FIXME: Model error type
-    async fn connect(&self, stream: S) -> std::io::Result<PgStream<S>>;
+    fn connect(&self, stream: S) -> impl Future<Output = std::io::Result<PgStream<S>>>;
 }
 
 #[cfg(feature = "tokio")]
 impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> Connect<S> for ConnectionBuilder {
     async fn connect(&self, mut stream: S) -> std::io::Result<PgStream<S>> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
         let startup = self.as_startup_message();
         stream.write_all(&startup).await?;
 
