@@ -1,9 +1,12 @@
 pub mod frontend {
     //! Logic for handling and representing Postgres frontend messages.
 
-    use std::fmt::Display;
-
     use bytes::{BufMut, Bytes, BytesMut};
+
+    pub const SSL_REQUEST: &[u8] = &[
+        0x00, 0x00, 0x00, 0x08, // length: 8
+        0x04, 0xD2, 0x16, 0x2F, // code: 80877103
+    ];
 
     /// Postgres frontend messages are framed by a 1 byte message code,
     /// followed by a u32 integer delineating the length of the rest of
@@ -15,7 +18,7 @@ pub mod frontend {
     /// For more information, see the official Postgres docs:
     /// <https://www.postgresql.org/docs/current/protocol-message-formats.html>
     #[repr(transparent)]
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    #[derive(Clone, Copy, PartialEq, Eq, Hash)]
     pub struct MessageCode(u8);
 
     impl MessageCode {
@@ -30,6 +33,7 @@ pub mod frontend {
         pub const FLUSH: Self = Self(b'H');
         pub const FUNCTION_CALL: Self = Self(b'F');
         pub const GSSENC_REQUEST: Self = Self(8);
+        pub const GSS_RESPONSE: Self = Self(b'p');
         pub const PARSE: Self = Self(b'P');
         pub const PASSWORD_MESSAGE: Self = Self(b'p');
         pub const QUERY: Self = Self(b'Q');
@@ -68,23 +72,93 @@ pub mod frontend {
         }
     }
 
-    impl Display for MessageCode {
+    impl std::fmt::Display for MessageCode {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             let name = match *self {
                 MessageCode::BIND => "Bind",
-                // TODO: fill in rest
+                MessageCode::CANCEL_REQUEST => "CancelRequest",
+                MessageCode::CLOSE => "Close",
+                MessageCode::COPY_DATA => "CopyData",
+                MessageCode::COPY_DONE => "CopyDone",
+                MessageCode::COPY_FAIL => "CopyFail",
+                MessageCode::DESCRIBE => "Describe",
+                MessageCode::EXECUTE => "Execute",
+                MessageCode::FLUSH => "Flush",
+                MessageCode::FUNCTION_CALL => "FunctionCall",
+                MessageCode::GSSENC_REQUEST => "GSSENCRequest",
+                MessageCode::PARSE => "Parse",
+                MessageCode::PASSWORD_MESSAGE => "PasswordMessage|GSSResponse|SASLResponse",
+                MessageCode::QUERY => "Query",
+                MessageCode::SYNC => "Sync",
+                MessageCode::TERMINATE => "Terminate",
                 _ => "Unknown",
             };
             write!(f, "{name}({})", self.0 as char)
         }
     }
 
+    impl std::fmt::Debug for MessageCode {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "MessageCode({})", self.0 as char)
+        }
+    }
+
     /// The object ID of the parameter data type
+    // TODO: I generated this list with AI. x-ref with PG docs
     #[repr(u32)]
-    #[derive(Debug, Clone, Copy, PartialEq)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub enum ParameterKind {
-        UNSPECIFIED = 0,
-        // TODO: fill in the rest
+        Unspecified = 0,
+        Bool = 16,
+        Bytea = 17,
+        Char = 18,
+        Name = 19,
+        Int8 = 20,
+        Int2 = 21,
+        Int2Vector = 22,
+        Int4 = 23,
+        Regproc = 24,
+        Text = 25,
+        Oid = 26,
+        Tid = 27,
+        Xid = 28,
+        Cid = 29,
+        OidVector = 30,
+
+        Json = 114,
+        Xml = 142,
+        PgNodeTree = 194,
+        Jsonb = 3802,
+
+        Float4 = 700,
+        Float8 = 701,
+        Money = 790,
+
+        Bpchar = 1042,
+        Varchar = 1043,
+        Date = 1082,
+        Time = 1083,
+        Timestamp = 1114,
+        Timestamptz = 1184,
+        Interval = 1186,
+        Timetz = 1266,
+
+        Numeric = 1700,
+        Uuid = 2950,
+        Record = 2249,
+        Cstring = 2275,
+        Any = 2276,
+        AnyArray = 2277,
+        Void = 2278,
+        Trigger = 2279,
+        LanguageHandler = 2280,
+        Internal = 2281,
+        Opaque = 2282,
+        AnyElement = 2283,
+        AnyNonArray = 2776,
+        AnyEnum = 3500,
+        FdwHandler = 3115,
+        AnyRange = 3831,
     }
 
     impl From<ParameterKind> for u32 {
@@ -258,8 +332,6 @@ pub mod frontend {
 pub mod backend {
     //! Logic for handling and representing Postgres backend messages.
 
-    use std::fmt::Display;
-
     use bytes::Bytes;
 
     /// Postgres backend messages are framed by a 1 byte message code,
@@ -272,7 +344,7 @@ pub mod backend {
     /// For more information, see the official Postgres docs:
     /// <https://www.postgresql.org/docs/current/protocol-message-formats.html>
     #[repr(transparent)]
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    #[derive(Clone, Copy, PartialEq, Eq, Hash)]
     pub struct MessageCode(u8);
 
     impl MessageCode {
@@ -290,7 +362,6 @@ pub mod backend {
         pub const EMPTY_QUERY_RESPONSE: Self = Self(b'I');
         pub const ERROR_RESPONSE: Self = Self(b'E');
         pub const FUNCTION_CALL_RESPONSE: Self = Self(b'V');
-        pub const GSS_RESPONSE: Self = Self(b'p');
         pub const NEGOTIATE_PROTOCOL_VERSION: Self = Self(b'v');
         pub const NO_DATA: Self = Self(b'n');
         pub const NOTICE_RESPONSE: Self = Self(b'N');
@@ -327,14 +398,42 @@ pub mod backend {
         }
     }
 
-    impl Display for MessageCode {
+    impl std::fmt::Display for MessageCode {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             let name = match *self {
                 MessageCode::AUTHENTICATION => "Authentication",
-                // TODO: fill in rest
+                MessageCode::BACKEND_KEY_DATA => "BackendKeyData",
+                MessageCode::BIND_COMPLETE => "BindComplete",
+                MessageCode::CLOSE_COMPLETE => "CloseComplete",
+                MessageCode::COMMAND_COMPLETE => "CommandComplete",
+                MessageCode::COPY_DATA => "CopyData",
+                MessageCode::COPY_DONE => "CopyDone",
+                MessageCode::COPY_IN_RESPONSE => "CopyInResponse",
+                MessageCode::COPY_OUT_RESPONSE => "CopyOutResponse",
+                MessageCode::COPY_BOTH_RESPONSE => "CopyBothResponse",
+                MessageCode::DATA_ROW => "DataRow",
+                MessageCode::EMPTY_QUERY_RESPONSE => "EmptyQueryResponse",
+                MessageCode::ERROR_RESPONSE => "ErrorResponse",
+                MessageCode::FUNCTION_CALL_RESPONSE => "FunctionCallResponse",
+                MessageCode::NEGOTIATE_PROTOCOL_VERSION => "NegotiateProtocolVersion",
+                MessageCode::NO_DATA => "NoData",
+                MessageCode::NOTICE_RESPONSE => "NoticeResponse",
+                MessageCode::NOTIFICATION_RESPONSE => "NotificationResponse",
+                MessageCode::PARAMETER_DESCRIPTION => "ParameterDescription",
+                MessageCode::PARAMETER_STATUS => "ParameterStatus",
+                MessageCode::PARSE_COMPLETE => "ParseComplete",
+                MessageCode::PORTAL_SUSPENDED => "PortalSuspended",
+                MessageCode::READY_FOR_QUERY => "ReadyForQuery",
+                MessageCode::ROW_DESCRIPTION => "RowDescription",
                 _ => "Unknown",
             };
             write!(f, "{name}({})", self.0 as char)
+        }
+    }
+
+    impl std::fmt::Debug for MessageCode {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "MessageCode({})", self.0 as char)
         }
     }
 
@@ -352,7 +451,7 @@ pub mod backend {
         }
     }
 
-    impl Display for PgFrame {
+    impl std::fmt::Display for PgFrame {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             write!(f, "{}: {:?}", self.code, self.body)
         }

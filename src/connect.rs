@@ -1,12 +1,9 @@
-use std::{
-    collections::HashMap,
-    net::{SocketAddr, ToSocketAddrs},
-};
+use std::collections::HashMap;
 
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{BufMut, BytesMut};
+use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::PgStream;
-use crate::frontend;
+use crate::{PgStream, backend, frontend, read_frame};
 
 pub enum AuthenticationMode {
     Trust,
@@ -64,30 +61,27 @@ impl std::fmt::Display for ProtocolVersion {
 }
 
 pub struct ConnectionBuilder {
-    database: String,
+    database: Option<String>,
     user: String,
-    addrs: Vec<SocketAddr>,
     auth: AuthenticationMode,
     protocol: ProtocolVersion,
+    upgrade_tls: bool,
     options: HashMap<String, String>,
 }
 
 impl ConnectionBuilder {
-    pub fn new(user: impl Into<String>, addrs: impl ToSocketAddrs) -> std::io::Result<Self> {
-        let user = user.into();
-        let addrs = addrs.to_socket_addrs()?.collect();
-
-        Ok(Self {
-            database: user.clone(),
-            user,
-            addrs,
+    pub fn new(user: impl Into<String>) -> Self {
+        Self {
+            database: None,
+            user: user.into(),
             auth: AuthenticationMode::Trust,
             protocol: CURRENT_VERSION,
+            upgrade_tls: false,
             options: HashMap::new(),
-        })
+        }
     }
 
-    pub fn database(mut self, db: impl Into<String>) -> Self {
+    pub fn database(mut self, db: impl Into<Option<String>>) -> Self {
         self.database = db.into();
         self
     }
@@ -107,12 +101,17 @@ impl ConnectionBuilder {
         self
     }
 
+    pub fn upgrade_tls(mut self, upgrade_tls: bool) -> Self {
+        self.upgrade_tls = upgrade_tls;
+        self
+    }
+
     pub fn add_option(mut self, key: impl Into<String>, val: impl Into<String>) -> Self {
         self.options.insert(key.into(), val.into());
         self
     }
 
-    fn as_startup_message(&self) -> Bytes {
+    fn as_startup_message(&self) -> Vec<u8> {
         let mut buf = BytesMut::new();
         frontend::frame(&mut buf, |buf| {
             buf.put_u32(self.protocol.into());
@@ -124,13 +123,19 @@ impl ConnectionBuilder {
 
             buf.put_slice("database".as_bytes());
             buf.put_u8(0);
-            buf.put_slice(self.database.as_bytes());
+            if let Some(db) = &self.database {
+                buf.put_slice(db.as_bytes());
+            } else {
+                buf.put_slice(self.user.as_bytes());
+            }
             buf.put_u8(0);
 
             // TODO: The rest of the startup message
+
+            buf.put_u8(0);
         });
 
-        buf.freeze()
+        buf.to_vec()
     }
 }
 
@@ -138,14 +143,119 @@ pub trait Connect<S> {
     fn connect(&self, stream: S) -> impl Future<Output = std::io::Result<PgStream<S>>>;
 }
 
-#[cfg(feature = "tokio")]
-impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> Connect<S> for ConnectionBuilder {
+impl<S: AsyncRead + AsyncWrite + Unpin> Connect<S> for ConnectionBuilder {
     async fn connect(&self, mut stream: S) -> std::io::Result<PgStream<S>> {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        if self.upgrade_tls {
+            stream.write_all(frontend::SSL_REQUEST).await?;
+            stream.flush().await?;
+
+            let mut buf = [0; 1];
+            stream.read_exact(&mut buf).await?;
+            let res = u8::from_be_bytes(buf) as char;
+
+            match res {
+                'S' => (),
+                'N' => (), // TODO: optionally allow this
+                _ => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("unexpected SSL response code {res}"),
+                    ));
+                }
+            };
+
+            // TODO: Rest of TLS upgrade. Should be library agnostic
+        }
 
         let startup = self.as_startup_message();
         stream.write_all(&startup).await?;
+        stream.flush().await?;
+
+        loop {
+            let message = read_frame(&mut stream).await.expect("ok");
+
+            const AUTH_OK: &[u8] = &0u32.to_be_bytes();
+            const AUTH_KERBEROS_V5: &[u8] = &2u32.to_be_bytes();
+            const AUTH_CLEARTEXT_PW: &[u8] = &3u32.to_be_bytes();
+            const AUTH_MD5_PW: &[u8] = &5u32.to_be_bytes();
+            const AUTH_GSS: &[u8] = &7u32.to_be_bytes();
+            const AUTH_SSPI: &[u8] = &9u32.to_be_bytes();
+            const AUTH_SASL: &[u8] = &10u32.to_be_bytes();
+
+            match message.code {
+                backend::MessageCode::ERROR_RESPONSE => {
+                    panic!("handle me: {}", String::from_utf8_lossy(&message.body));
+                }
+                backend::MessageCode::AUTHENTICATION => match &message.body[..4] {
+                    AUTH_OK => break,
+                    AUTH_CLEARTEXT_PW => match &self.auth {
+                        AuthenticationMode::Password(pw) => {
+                            let mut msg = BytesMut::new();
+                            frontend::MessageCode::PASSWORD_MESSAGE.frame(&mut msg, |buf| {
+                                buf.put_slice(pw.as_bytes());
+                                buf.put_u8(0);
+                            });
+                            stream.write_all(&msg).await?;
+                            stream.flush().await?;
+                        }
+                        _ => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                "password required",
+                            ));
+                        }
+                    },
+                    AUTH_SASL => {
+                        unimplemented!("SASL not supported yet")
+                    }
+                    AUTH_KERBEROS_V5 => {
+                        unimplemented!("Kerberos not supported yet")
+                    }
+                    AUTH_MD5_PW => {
+                        unimplemented!("MD5 not supported yet")
+                    }
+                    AUTH_GSS => {
+                        unimplemented!("GSS not supported yet")
+                    }
+                    AUTH_SSPI => {
+                        unimplemented!("SSPI not supported yet")
+                    }
+                    auth_code => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!(
+                                "unexpected auth response code {}",
+                                u32::from_be_bytes(
+                                    auth_code.try_into().expect("code should be 4 bytes")
+                                )
+                            ),
+                        ));
+                    }
+                },
+                code => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("unexpected message code {code}",),
+                    ));
+                }
+            }
+        }
 
         Ok(PgStream::raw(stream))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::ProtocolVersion;
+
+    #[test]
+    fn test_protocol_version() {
+        let major = 3;
+        let minor = 0;
+        let version = ProtocolVersion::new(major, minor);
+        assert_eq!(major, version.major());
+        assert_eq!(minor, version.minor());
+        assert_eq!(196608, version.0);
     }
 }

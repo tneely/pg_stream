@@ -5,6 +5,7 @@ use std::io::{Read, Write};
 
 use bytes::{BufMut, BytesMut};
 pub use connect::*;
+use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub use message::{backend, frontend};
 
 use crate::message::{
@@ -165,10 +166,11 @@ impl<S: Read> PgStream<S> {
         self.stream.read_exact(&mut buf)?;
         let len = u32::from_be_bytes(buf) as usize - size_of::<u32>();
 
-        // FIXME: Is there a better / more efficient way to do this?
+        // FIXME: Check len size before allocating too much space
         let mut body = BytesMut::with_capacity(len);
-        for _ in 0..body.capacity() {
-            body.put_u8(0);
+        // SAFETY: The uninitialized bytes are never read
+        unsafe {
+            body.set_len(len);
         }
         self.stream.read_exact(&mut body)?;
 
@@ -183,25 +185,38 @@ impl<S: Write> PgStream<S> {
     }
 }
 
-#[cfg(feature = "tokio")]
-impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> PgStream<S> {
-    pub async fn flush(&mut self) -> std::io::Result<()> {
-        use tokio::io::AsyncWriteExt;
-
-        self.stream.write_all_buf(&mut self.buf).await
-    }
-
+impl<S: AsyncRead + Unpin> PgStream<S> {
     pub async fn read_frame(&mut self) -> std::io::Result<crate::backend::PgFrame> {
-        use crate::backend::{MessageCode, PgFrame};
-        use tokio::io::AsyncReadExt;
+        read_frame(&mut self.stream).await
+    }
+}
 
-        let code: MessageCode = self.stream.read_u8().await?.into();
-        let len = self.stream.read_u32().await? as usize;
-        // FIXME: Check len size before allocating too much space
-        let mut body = BytesMut::with_capacity(len);
-        self.stream.read_exact(&mut body).await?;
+async fn read_frame(
+    mut stream: impl AsyncRead + Unpin,
+) -> std::io::Result<crate::backend::PgFrame> {
+    let mut buf = [0; 1];
+    stream.read_exact(&mut buf).await?;
+    let code: backend::MessageCode = u8::from_be_bytes(buf).into();
 
-        Ok(PgFrame::new(code, body))
+    let mut buf = [0; 4];
+    stream.read_exact(&mut buf).await?;
+    let len = u32::from_be_bytes(buf) as usize - size_of::<u32>();
+
+    // FIXME: Check len size before allocating too much space
+    let mut body = BytesMut::with_capacity(len);
+    // SAFETY: The uninitialized bytes are never read
+    unsafe {
+        body.set_len(len);
+    }
+    stream.read_exact(&mut body).await?;
+
+    Ok(PgFrame::new(code, body))
+}
+
+impl<S: AsyncWrite + Unpin> PgStream<S> {
+    pub async fn flush(&mut self) -> std::io::Result<()> {
+        self.stream.write_all(&mut self.buf).await?;
+        self.stream.flush().await
     }
 }
 
@@ -231,7 +246,7 @@ mod tests {
     #[test]
     fn test_put_parse() {
         let mut pg_stream = PgStream::raw(Vec::<u8>::new());
-        pg_stream.put_parse("STMT", "SELECT 1", [ParameterKind::UNSPECIFIED]);
+        pg_stream.put_parse("STMT", "SELECT 1", [ParameterKind::Unspecified]);
 
         let mut expected = BytesMut::new();
         expected.put_u8(b'P');
