@@ -1,6 +1,7 @@
+use base64::Engine;
+use base64::prelude::BASE64_STANDARD;
 use pg_stream::{AuthenticationMode, ConnectionBuilder, backend};
 use postgresql_embedded::{PostgreSQL, Settings, Status};
-use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::OnceCell;
@@ -13,15 +14,6 @@ static PG_INSTANCE: OnceCell<PostgreSQL> = OnceCell::const_new();
 async fn run_pg() -> Result<&'static PostgreSQL, postgresql_embedded::Error> {
     PG_INSTANCE
         .get_or_try_init(|| async {
-            let cert_dir = PathBuf::from("tests/data/certs");
-
-            // SAFETY: this is run in a test
-            unsafe {
-                env::set_var("PGSSLKEY", cert_dir.join("server.key"));
-                env::set_var("PGSSLCERT", cert_dir.join("server.crt"));
-                env::set_var("PGSSLROOTCERT", cert_dir.join("server.crt"));
-            }
-
             let settings = Settings {
                 data_dir: PathBuf::from("data/db"),
                 port: 5432,
@@ -31,6 +23,9 @@ async fn run_pg() -> Result<&'static PostgreSQL, postgresql_embedded::Error> {
 
             let mut pg = PostgreSQL::new(settings);
             pg.setup().await?;
+            tokio::fs::copy("tests/data/pg/postgresql.conf", "data/db/postgresql.conf").await?;
+            tokio::fs::copy("tests/data/certs/server.crt", "data/db/server.crt").await?;
+            tokio::fs::copy("tests/data/certs/server.key", "data/db/server.key").await?;
             pg.start().await?;
 
             Ok(pg)
@@ -94,7 +89,6 @@ async fn test_pg_startup_tcp() {
     }
 }
 
-#[ignore = "postgres doesn't seem to be compiled with tls support :/"]
 #[tokio::test]
 async fn test_pg_startup_tls() {
     let pg = run_pg().await.unwrap();
@@ -107,8 +101,12 @@ async fn test_pg_startup_tls() {
     stream.set_nodelay(true).unwrap();
     let mut stream = cb
         .connect_with_tls(stream.compat(), async |s| {
+            rustls::crypto::aws_lc_rs::default_provider()
+                .install_default()
+                .unwrap();
+
             let mut root_cert_store = RootCertStore::empty();
-            let cert_bytes = tokio::fs::read("tests/data/certs/server.crt").await?;
+            let cert_bytes = pem_to_der("tests/data/certs/ca.crt").await?;
             root_cert_store
                 .add(cert_bytes.into())
                 .expect("cert should be valid");
@@ -138,4 +136,21 @@ async fn test_pg_startup_tls() {
             c => panic!("unexpected message code {c}"),
         }
     }
+}
+
+async fn pem_to_der(pem_path: &str) -> std::io::Result<Vec<u8>> {
+    let pem_data = tokio::fs::read_to_string(pem_path).await?;
+
+    // extract the Base64 section between "-----BEGIN CERTIFICATE-----" and "-----END CERTIFICATE-----"
+    let base64_cert = pem_data
+        .lines()
+        .filter(|line| !line.starts_with("-----"))
+        .collect::<Vec<_>>()
+        .join("");
+
+    let der_bytes = BASE64_STANDARD
+        .decode(base64_cert)
+        .expect("should decode Base64 PEM certificate");
+
+    Ok(der_bytes)
 }
