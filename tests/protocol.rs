@@ -1,47 +1,130 @@
-use pg_embed::pg_enums::PgAuthMethod;
-use pg_embed::pg_fetch::{PG_V15, PgFetchSettings};
-use pg_embed::postgres::{PgEmbed, PgSettings};
-use pg_stream::{AuthenticationMode, Connect, ConnectionBuilder, backend};
+use pg_stream::{AuthenticationMode, ConnectionBuilder, backend};
+use postgresql_embedded::{PostgreSQL, Settings, Status};
+use std::env;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::sync::Arc;
+use tokio::sync::OnceCell;
+use tokio_rustls::TlsConnector;
+use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 use tokio_util::compat::TokioAsyncReadCompatExt;
 
-async fn run_pg() -> Result<PgEmbed, pg_embed::pg_errors::PgEmbedError> {
-    let pg_settings = PgSettings {
-        database_dir: PathBuf::from("data/db"),
-        port: 5432,
-        user: "postgres".to_string(),
-        password: "password".to_string(),
-        auth_method: PgAuthMethod::Plain,
-        persistent: false,
-        timeout: Some(Duration::from_secs(15)),
-        migration_dir: None,
+static PG_INSTANCE: OnceCell<PostgreSQL> = OnceCell::const_new();
+
+async fn run_pg() -> Result<&'static PostgreSQL, postgresql_embedded::Error> {
+    PG_INSTANCE
+        .get_or_try_init(|| async {
+            let cert_dir = PathBuf::from("tests/data/certs");
+
+            // SAFETY: this is run in a test
+            unsafe {
+                env::set_var("PGSSLKEY", cert_dir.join("server.key"));
+                env::set_var("PGSSLCERT", cert_dir.join("server.crt"));
+                env::set_var("PGSSLROOTCERT", cert_dir.join("server.crt"));
+            }
+
+            let settings = Settings {
+                data_dir: PathBuf::from("data/db"),
+                port: 5432,
+                username: "postgres".into(),
+                ..Settings::default()
+            };
+
+            let mut pg = PostgreSQL::new(settings);
+            pg.setup().await?;
+            pg.start().await?;
+
+            Ok(pg)
+        })
+        .await
+}
+
+#[ctor::dtor]
+fn drop_pg() {
+    use postgresql_commands::{
+        CommandBuilder,
+        pg_ctl::{Mode, PgCtlBuilder, ShutdownMode},
     };
+    use std::fs::{remove_dir_all, remove_file};
 
-    let fetch_settings = PgFetchSettings {
-        version: PG_V15,
-        ..Default::default()
-    };
+    // XXX: There's no guarantee that PostgreSQL will be dropped when the tests end,
+    // so we need to take matters into our own hands and clean up manually.
+    if let Some(pg) = PG_INSTANCE.get() {
+        let settings = pg.settings();
+        if pg.status() == Status::Started {
+            let mut pg_ctl = PgCtlBuilder::from(settings)
+                .mode(Mode::Stop)
+                .pgdata(&settings.data_dir)
+                .shutdown_mode(ShutdownMode::Fast)
+                .wait()
+                .build();
 
-    let mut pg = PgEmbed::new(pg_settings, fetch_settings).await?;
+            pg_ctl.output().expect("postgres should stop");
+        }
 
-    pg.setup().await?;
-    pg.start_db().await?;
-
-    Ok(pg)
+        if settings.temporary {
+            remove_dir_all(&settings.data_dir).expect("dir should delete");
+            remove_file(&settings.password_file).expect("pw file should delete");
+        }
+    }
 }
 
 #[tokio::test]
-async fn test_pg_startup() {
-    let _pg = run_pg().await.unwrap();
+async fn test_pg_startup_tcp() {
+    let pg = run_pg().await.unwrap();
     let cb = ConnectionBuilder::new("postgres")
-        .auth(AuthenticationMode::Password("password".to_string()));
+        .auth(AuthenticationMode::Password(pg.settings().password.clone()));
 
     let stream = tokio::net::TcpStream::connect("localhost:5432")
         .await
         .unwrap();
     stream.set_nodelay(true).unwrap();
     let mut stream = cb.connect(stream.compat()).await.unwrap();
+
+    stream.put_sync();
+    stream.flush().await.unwrap();
+
+    loop {
+        let frame = stream.read_frame().await.unwrap();
+        match frame.code {
+            backend::MessageCode::PARAMETER_STATUS => continue,
+            backend::MessageCode::BACKEND_KEY_DATA => continue,
+            backend::MessageCode::READY_FOR_QUERY => break,
+            c => panic!("unexpected message code {c}"),
+        }
+    }
+}
+
+#[ignore = "postgres doesn't seem to be compiled with tls support :/"]
+#[tokio::test]
+async fn test_pg_startup_tls() {
+    let pg = run_pg().await.unwrap();
+    let cb = ConnectionBuilder::new("postgres")
+        .auth(AuthenticationMode::Password(pg.settings().password.clone()));
+
+    let stream = tokio::net::TcpStream::connect("localhost:5432")
+        .await
+        .unwrap();
+    stream.set_nodelay(true).unwrap();
+    let mut stream = cb
+        .connect_with_tls(stream.compat(), async |s| {
+            let mut root_cert_store = RootCertStore::empty();
+            let cert_bytes = tokio::fs::read("tests/data/certs/server.crt").await?;
+            root_cert_store
+                .add(cert_bytes.into())
+                .expect("cert should be valid");
+
+            let config = ClientConfig::builder()
+                .with_root_certificates(root_cert_store)
+                .with_no_client_auth();
+
+            let connector = TlsConnector::from(Arc::new(config));
+
+            let server_name = "localhost".try_into().unwrap();
+            let stream = connector.connect(server_name, s.into_inner()).await?;
+            Ok(stream.compat())
+        })
+        .await
+        .unwrap();
 
     stream.put_sync();
     stream.flush().await.unwrap();

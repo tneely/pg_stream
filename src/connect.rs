@@ -65,7 +65,6 @@ pub struct ConnectionBuilder {
     user: String,
     auth: AuthenticationMode,
     protocol: ProtocolVersion,
-    upgrade_tls: bool,
     options: HashMap<String, String>,
 }
 
@@ -76,7 +75,6 @@ impl ConnectionBuilder {
             user: user.into(),
             auth: AuthenticationMode::Trust,
             protocol: CURRENT_VERSION,
-            upgrade_tls: false,
             options: HashMap::new(),
         }
     }
@@ -98,11 +96,6 @@ impl ConnectionBuilder {
 
     pub fn protocol(mut self, protocol: impl Into<ProtocolVersion>) -> Self {
         self.protocol = protocol.into();
-        self
-    }
-
-    pub fn upgrade_tls(mut self, upgrade_tls: bool) -> Self {
-        self.upgrade_tls = upgrade_tls;
         self
     }
 
@@ -139,34 +132,43 @@ impl ConnectionBuilder {
     }
 }
 
-pub trait Connect<S> {
-    fn connect(&self, stream: S) -> impl Future<Output = std::io::Result<PgStream<S>>>;
-}
+impl ConnectionBuilder {
+    pub async fn connect_with_tls<S, T, F, Fut>(
+        &self,
+        mut stream: S,
+        upgrade_fn: F,
+    ) -> std::io::Result<PgStream<T>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+        T: AsyncRead + AsyncWrite + Unpin,
+        F: FnOnce(S) -> Fut,
+        Fut: Future<Output = std::io::Result<T>>,
+    {
+        stream.write_all(frontend::SSL_REQUEST).await?;
+        stream.flush().await?;
 
-impl<S: AsyncRead + AsyncWrite + Unpin> Connect<S> for ConnectionBuilder {
-    async fn connect(&self, mut stream: S) -> std::io::Result<PgStream<S>> {
-        if self.upgrade_tls {
-            stream.write_all(frontend::SSL_REQUEST).await?;
-            stream.flush().await?;
+        let mut buf = [0; 1];
+        stream.read_exact(&mut buf).await?;
+        let res = u8::from_be_bytes(buf) as char;
 
-            let mut buf = [0; 1];
-            stream.read_exact(&mut buf).await?;
-            let res = u8::from_be_bytes(buf) as char;
+        let stream = match res {
+            'S' => upgrade_fn(stream).await,
+            'N' => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "TLS not supported".to_string(),
+            )),
+            _ => Err(std::io::Error::other(format!(
+                "unexpected SSL response code {res}"
+            ))),
+        }?;
 
-            match res {
-                'S' => (),
-                'N' => (), // TODO: optionally allow this
-                _ => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("unexpected SSL response code {res}"),
-                    ));
-                }
-            };
+        self.connect(stream).await
+    }
 
-            // TODO: Rest of TLS upgrade. Should be library agnostic
-        }
-
+    pub async fn connect<S>(&self, mut stream: S) -> std::io::Result<PgStream<S>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
         let startup = self.as_startup_message();
         stream.write_all(&startup).await?;
         stream.flush().await?;
@@ -221,22 +223,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connect<S> for ConnectionBuilder {
                         unimplemented!("SSPI not supported yet")
                     }
                     auth_code => {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            format!(
-                                "unexpected auth response code {}",
-                                u32::from_be_bytes(
-                                    auth_code.try_into().expect("code should be 4 bytes")
-                                )
-                            ),
-                        ));
+                        return Err(std::io::Error::other(format!(
+                            "unexpected auth response code {}",
+                            u32::from_be_bytes(
+                                auth_code.try_into().expect("code should be 4 bytes")
+                            )
+                        )));
                     }
                 },
                 code => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("unexpected message code {code}",),
-                    ));
+                    return Err(std::io::Error::other(format!(
+                        "unexpected message code {code}",
+                    )));
                 }
             }
         }

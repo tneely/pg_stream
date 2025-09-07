@@ -115,7 +115,7 @@ impl<S> PgStream<S> {
             // result columns; or it can equal the actual number of result columns.
             b.put_u16(result_fmt.len() as u16);
             for code in result_fmt {
-                b.put_u16((*code).into() as u16);
+                b.put_u16((*code).into());
             }
         });
     }
@@ -180,7 +180,7 @@ impl<S: Read> PgStream<S> {
 
 impl<S: Write> PgStream<S> {
     pub fn flush_blocking(&mut self) -> std::io::Result<()> {
-        self.stream.write_all(&mut self.buf)?;
+        self.stream.write_all(&self.buf)?;
         self.stream.flush()
     }
 }
@@ -215,7 +215,7 @@ async fn read_frame(
 
 impl<S: AsyncWrite + Unpin> PgStream<S> {
     pub async fn flush(&mut self) -> std::io::Result<()> {
-        self.stream.write_all(&mut self.buf).await?;
+        self.stream.write_all(&self.buf).await?;
         self.stream.flush().await
     }
 }
