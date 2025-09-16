@@ -163,6 +163,14 @@ pub enum ParameterKind {
     AnyRange = 3831,
 }
 
+impl ParameterKind {
+    pub fn as_u32_array(param_kinds: &[ParameterKind]) -> &[u32] {
+        // SAFETY: The internal representation of ParameterKind
+        // is u32
+        unsafe { std::slice::from_raw_parts(param_kinds.as_ptr() as *const u32, param_kinds.len()) }
+    }
+}
+
 impl From<ParameterKind> for u32 {
     fn from(value: ParameterKind) -> Self {
         value as u32
@@ -180,14 +188,14 @@ pub fn frame(buf: &mut BytesMut, payload_fn: impl FnOnce(&mut BytesMut)) {
     buf[base..base + size_of::<u32>()].copy_from_slice(&len.to_be_bytes());
 }
 
-fn raw_prefix(buf: &mut BytesMut, b: &[u8]) {
+fn raw_prefix(buf: &mut impl BufMut, b: &[u8]) {
     buf.put_u32(b.len() as u32);
-    buf.extend_from_slice(b);
+    buf.put_slice(b);
 }
 
-fn string_prefix(buf: &mut BytesMut, b: &[u8]) {
+fn string_prefix(buf: &mut impl BufMut, b: &[u8]) {
     buf.put_u32(b.len() as u32 + 1);
-    buf.extend_from_slice(b);
+    buf.put_slice(b);
     buf.put_u32(0);
 }
 
@@ -211,6 +219,14 @@ impl TargetKind {
 pub enum FormatCode {
     Text = 0,
     Binary = 1,
+}
+
+impl FormatCode {
+    pub fn as_u16_array(codes: &[FormatCode]) -> &[u16] {
+        // SAFETY: The internal representation of FormatCode
+        // is u16
+        unsafe { std::slice::from_raw_parts(codes.as_ptr() as *const u16, codes.len()) }
+    }
 }
 
 impl From<FormatCode> for u16 {
@@ -244,7 +260,7 @@ impl BindParameter {
     }
 
     /// Byte encoding
-    pub fn encode(&self, buf: &mut BytesMut) {
+    pub fn encode(&self, buf: &mut impl BufMut) {
         match self {
             BindParameter::Null => buf.put_i32(-1),
             BindParameter::Bool(b) => raw_prefix(buf, &[*b as u8]),

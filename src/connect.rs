@@ -240,7 +240,7 @@ impl ConnectionBuilder {
             }
         }
 
-        Ok(PgStream::raw(stream))
+        Ok(PgStream::from_stream(stream))
     }
 }
 

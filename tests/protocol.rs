@@ -1,5 +1,6 @@
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
+use pg_stream::messages::frontend;
 use pg_stream::{AuthenticationMode, ConnectionBuilder, messages::backend};
 use postgresql_embedded::{PostgreSQL, Settings, Status};
 use std::path::PathBuf;
@@ -75,9 +76,7 @@ async fn test_pg_startup_tcp() {
     stream.set_nodelay(true).unwrap();
     let mut stream = cb.connect(stream.compat()).await.unwrap();
 
-    stream.put_sync();
-    stream.flush().await.unwrap();
-
+    // FIXME: Move to `connect`
     loop {
         let frame = stream.read_frame().await.unwrap();
         match frame.code {
@@ -122,8 +121,28 @@ async fn test_pg_startup_tls() {
         .await
         .unwrap();
 
-    stream.put_sync();
-    stream.flush().await.unwrap();
+    loop {
+        let frame = stream.read_frame().await.unwrap();
+        match frame.code {
+            backend::MessageCode::PARAMETER_STATUS => continue,
+            backend::MessageCode::BACKEND_KEY_DATA => continue,
+            backend::MessageCode::READY_FOR_QUERY => break,
+            c => panic!("unexpected message code {c}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_pg_extended_protocol() {
+    let pg = run_pg().await.unwrap();
+    let cb = ConnectionBuilder::new("postgres")
+        .auth(AuthenticationMode::Password(pg.settings().password.clone()));
+
+    let stream = tokio::net::TcpStream::connect("localhost:5432")
+        .await
+        .unwrap();
+    stream.set_nodelay(true).unwrap();
+    let mut stream = cb.connect(stream.compat()).await.unwrap();
 
     loop {
         let frame = stream.read_frame().await.unwrap();
@@ -134,6 +153,29 @@ async fn test_pg_startup_tls() {
             c => panic!("unexpected message code {c}"),
         }
     }
+
+    stream
+        .put_parse("stmt", "SELECT $1", [frontend::ParameterKind::Int4])
+        .put_describe(frontend::TargetKind::new_stmt("stmt"))
+        .put_bind("", "stmt", [frontend::BindParameter::Int4(1)], [])
+        .put_execute("", None)
+        .put_sync();
+    stream.flush().await.unwrap();
+
+    let frame = stream.read_frame().await.unwrap();
+    assert_eq!(frame.code, backend::MessageCode::PARSE_COMPLETE);
+    let frame = stream.read_frame().await.unwrap();
+    assert_eq!(frame.code, backend::MessageCode::PARAMETER_DESCRIPTION);
+    let frame = stream.read_frame().await.unwrap();
+    assert_eq!(frame.code, backend::MessageCode::ROW_DESCRIPTION);
+    let frame = stream.read_frame().await.unwrap();
+    assert_eq!(frame.code, backend::MessageCode::BIND_COMPLETE);
+    let frame = stream.read_frame().await.unwrap();
+    assert_eq!(frame.code, backend::MessageCode::DATA_ROW);
+    let frame = stream.read_frame().await.unwrap();
+    assert_eq!(frame.code, backend::MessageCode::COMMAND_COMPLETE);
+    let frame = stream.read_frame().await.unwrap();
+    assert_eq!(frame.code, backend::MessageCode::READY_FOR_QUERY);
 }
 
 async fn pem_to_der(pem_path: &str) -> std::io::Result<Vec<u8>> {

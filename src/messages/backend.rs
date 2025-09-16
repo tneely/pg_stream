@@ -106,6 +106,7 @@ impl std::fmt::Debug for MessageCode {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct PgFrame {
     pub code: MessageCode,
     pub body: Bytes,
