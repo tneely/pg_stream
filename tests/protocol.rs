@@ -1,6 +1,6 @@
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
-use pg_stream::{AuthenticationMode, ConnectionBuilder, backend};
+use pg_stream::{AuthenticationMode, ConnectionBuilder, messages::backend};
 use postgresql_embedded::{PostgreSQL, Settings, Status};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -41,7 +41,7 @@ fn drop_pg() {
     };
     use std::fs::{remove_dir_all, remove_file};
 
-    // XXX: There's no guarantee that PostgreSQL will be dropped when the tests end,
+    // XXX: there's no guarantee that PostgreSQL will be dropped when the tests end,
     // so we need to take matters into our own hands and clean up manually.
     if let Some(pg) = PG_INSTANCE.get() {
         let settings = pg.settings();
@@ -107,9 +107,7 @@ async fn test_pg_startup_tls() {
 
             let mut root_cert_store = RootCertStore::empty();
             let cert_bytes = pem_to_der("tests/data/certs/ca.crt").await?;
-            root_cert_store
-                .add(cert_bytes.into())
-                .expect("cert should be valid");
+            root_cert_store.add(cert_bytes.into()).unwrap();
 
             let config = ClientConfig::builder()
                 .with_root_certificates(root_cert_store)
@@ -147,10 +145,7 @@ async fn pem_to_der(pem_path: &str) -> std::io::Result<Vec<u8>> {
         .filter(|line| !line.starts_with("-----"))
         .collect::<Vec<_>>()
         .join("");
-
-    let der_bytes = BASE64_STANDARD
-        .decode(base64_cert)
-        .expect("should decode Base64 PEM certificate");
+    let der_bytes = BASE64_STANDARD.decode(base64_cert).unwrap();
 
     Ok(der_bytes)
 }

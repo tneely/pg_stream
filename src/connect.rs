@@ -3,7 +3,10 @@ use std::collections::HashMap;
 use bytes::{BufMut, BytesMut};
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::{PgStream, backend, frontend, read_frame};
+use crate::{
+    PgStream,
+    messages::{backend, frontend},
+};
 
 pub enum AuthenticationMode {
     Trust,
@@ -155,10 +158,10 @@ impl ConnectionBuilder {
             'S' => upgrade_fn(stream).await,
             'N' => Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
-                "TLS not supported".to_string(),
+                "TLS is not supported".to_string(),
             )),
             _ => Err(std::io::Error::other(format!(
-                "unexpected SSL response code {res}"
+                "unexpected SSL response code '{res}'"
             ))),
         }?;
 
@@ -174,7 +177,7 @@ impl ConnectionBuilder {
         stream.flush().await?;
 
         loop {
-            let message = read_frame(&mut stream).await.expect("ok");
+            let message = backend::read_frame(&mut stream).await.expect("ok");
 
             const AUTH_OK: &[u8] = &0u32.to_be_bytes();
             const AUTH_KERBEROS_V5: &[u8] = &2u32.to_be_bytes();
@@ -225,9 +228,7 @@ impl ConnectionBuilder {
                     auth_code => {
                         return Err(std::io::Error::other(format!(
                             "unexpected auth response code {}",
-                            u32::from_be_bytes(
-                                auth_code.try_into().expect("code should be 4 bytes")
-                            )
+                            u32::from_be_bytes(auth_code.try_into().unwrap())
                         )));
                     }
                 },
