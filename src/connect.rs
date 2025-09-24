@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use bytes::{BufMut, BytesMut};
+use bytes::{Buf, BufMut, BytesMut};
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::{
@@ -61,6 +61,13 @@ impl std::fmt::Display for ProtocolVersion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}.{}", self.major(), self.minor())
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct StartupResponse {
+    pub process_id: u32,
+    pub secret_key: u32,
+    pub parameters: HashMap<String, String>,
 }
 
 pub struct ConnectionBuilder {
@@ -140,7 +147,7 @@ impl ConnectionBuilder {
         &self,
         mut stream: S,
         upgrade_fn: F,
-    ) -> std::io::Result<PgStream<T>>
+    ) -> std::io::Result<(PgStream<T>, StartupResponse)>
     where
         S: AsyncRead + AsyncWrite + Unpin,
         T: AsyncRead + AsyncWrite + Unpin,
@@ -168,7 +175,7 @@ impl ConnectionBuilder {
         self.connect(stream).await
     }
 
-    pub async fn connect<S>(&self, mut stream: S) -> std::io::Result<PgStream<S>>
+    pub async fn connect<S>(&self, mut stream: S) -> std::io::Result<(PgStream<S>, StartupResponse)>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
@@ -176,6 +183,8 @@ impl ConnectionBuilder {
         stream.write_all(&startup).await?;
         stream.flush().await?;
 
+        // FIXME: Move loop to state machine once I have a better understanding
+        // of how the auth flow works
         loop {
             let message = backend::read_frame(&mut stream).await.expect("ok");
 
@@ -240,7 +249,30 @@ impl ConnectionBuilder {
             }
         }
 
-        Ok(PgStream::from_stream(stream))
+        let mut startup_res = StartupResponse {
+            process_id: 0,
+            secret_key: 0,
+            parameters: HashMap::new(),
+        };
+
+        loop {
+            let mut frame = backend::read_frame(&mut stream).await?;
+            match frame.code {
+                backend::MessageCode::PARAMETER_STATUS => {
+                    let key = backend::read_cstring(&mut frame.body)?;
+                    let val = backend::read_cstring(&mut frame.body)?;
+                    startup_res.parameters.insert(key, val);
+                }
+                backend::MessageCode::BACKEND_KEY_DATA => {
+                    startup_res.process_id = frame.body.get_u32();
+                    startup_res.secret_key = frame.body.get_u32();
+                }
+                backend::MessageCode::READY_FOR_QUERY => break,
+                c => panic!("unexpected message code {c}"),
+            }
+        }
+
+        Ok((PgStream::from_stream(stream), startup_res))
     }
 }
 

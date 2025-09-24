@@ -1,7 +1,16 @@
 //! Logic for handling and representing Postgres backend messages.
 
+use std::io::Read;
+
 use bytes::{Bytes, BytesMut};
 use futures::{AsyncRead, AsyncReadExt};
+
+// Postgres won't allocate memory greater 1GiB. It probably won't
+// write messages anywhere close to this size either, but this
+// gives us a nice upper bound to prevent misbehaving servers
+// from OOMing the client.
+// <https://github.com/postgres/postgres/blob/879c492480d0e9ad8155c4269f95c5e8add41901/src/include/utils/memutils.h#L40>
+const MAX_FRAME_SIZE_BYTES: usize = 1 << 30; // 1GiB
 
 /// Postgres backend messages are framed by a 1 byte message code,
 /// followed by a u32 integer delineating the length of the rest of
@@ -127,6 +136,21 @@ impl std::fmt::Display for PgFrame {
     }
 }
 
+pub fn read_frame_blocking(mut stream: impl Read) -> std::io::Result<PgFrame> {
+    let mut buf = [0; 1];
+    stream.read_exact(&mut buf)?;
+    let code: MessageCode = u8::from_be_bytes(buf).into();
+
+    let mut buf = [0; 4];
+    stream.read_exact(&mut buf)?;
+    let len = u32::from_be_bytes(buf) as usize - size_of::<u32>();
+    // SAFETY: The uninitialized bytes are never read
+    let mut body = unsafe { init_body(len)? };
+    stream.read_exact(&mut body)?;
+
+    Ok(PgFrame::new(code, body))
+}
+
 pub async fn read_frame(mut stream: impl AsyncRead + Unpin) -> std::io::Result<PgFrame> {
     let mut buf = [0; 1];
     stream.read_exact(&mut buf).await?;
@@ -135,14 +159,39 @@ pub async fn read_frame(mut stream: impl AsyncRead + Unpin) -> std::io::Result<P
     let mut buf = [0; 4];
     stream.read_exact(&mut buf).await?;
     let len = u32::from_be_bytes(buf) as usize - size_of::<u32>();
-
-    // FIXME: Check len size before allocating too much space
-    let mut body = BytesMut::with_capacity(len);
     // SAFETY: The uninitialized bytes are never read
-    unsafe {
-        body.set_len(len);
-    }
+    let mut body = unsafe { init_body(len)? };
     stream.read_exact(&mut body).await?;
 
     Ok(PgFrame::new(code, body))
+}
+
+unsafe fn init_body(len: usize) -> std::io::Result<BytesMut> {
+    if len > MAX_FRAME_SIZE_BYTES {
+        let err_msg = format!("frame size exceeds {MAX_FRAME_SIZE_BYTES}B");
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::QuotaExceeded,
+            err_msg,
+        ));
+    }
+    let mut body = BytesMut::with_capacity(len);
+    unsafe {
+        body.set_len(len);
+    }
+    Ok(body)
+}
+
+pub fn read_cstring(bytes: &mut Bytes) -> std::io::Result<String> {
+    let Some(end) = bytes.iter().position(|&b| b == 0) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "null terminator missing",
+        ));
+    };
+
+    let bytes = bytes.split_to(end + 1);
+    match String::from_utf8(bytes[..end].to_vec()) {
+        Ok(string) => Ok(string),
+        Err(err) => Err(std::io::Error::other(err)),
+    }
 }

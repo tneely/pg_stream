@@ -74,18 +74,10 @@ async fn test_pg_startup_tcp() {
         .await
         .unwrap();
     stream.set_nodelay(true).unwrap();
-    let mut stream = cb.connect(stream.compat()).await.unwrap();
+    let (_, res) = cb.connect(stream.compat()).await.unwrap();
 
-    // FIXME: Move to `connect`
-    loop {
-        let frame = stream.read_frame().await.unwrap();
-        match frame.code {
-            backend::MessageCode::PARAMETER_STATUS => continue,
-            backend::MessageCode::BACKEND_KEY_DATA => continue,
-            backend::MessageCode::READY_FOR_QUERY => break,
-            c => panic!("unexpected message code {c}"),
-        }
-    }
+    let encoding = res.parameters.get("client_encoding").unwrap();
+    assert_eq!(encoding, "UTF8");
 }
 
 #[tokio::test]
@@ -98,7 +90,7 @@ async fn test_pg_startup_tls() {
         .await
         .unwrap();
     stream.set_nodelay(true).unwrap();
-    let mut stream = cb
+    let (_, res) = cb
         .connect_with_tls(stream.compat(), async |s| {
             rustls::crypto::aws_lc_rs::default_provider()
                 .install_default()
@@ -121,15 +113,8 @@ async fn test_pg_startup_tls() {
         .await
         .unwrap();
 
-    loop {
-        let frame = stream.read_frame().await.unwrap();
-        match frame.code {
-            backend::MessageCode::PARAMETER_STATUS => continue,
-            backend::MessageCode::BACKEND_KEY_DATA => continue,
-            backend::MessageCode::READY_FOR_QUERY => break,
-            c => panic!("unexpected message code {c}"),
-        }
-    }
+    let encoding = res.parameters.get("client_encoding").unwrap();
+    assert_eq!(encoding, "UTF8");
 }
 
 #[tokio::test]
@@ -142,17 +127,7 @@ async fn test_pg_extended_protocol() {
         .await
         .unwrap();
     stream.set_nodelay(true).unwrap();
-    let mut stream = cb.connect(stream.compat()).await.unwrap();
-
-    loop {
-        let frame = stream.read_frame().await.unwrap();
-        match frame.code {
-            backend::MessageCode::PARAMETER_STATUS => continue,
-            backend::MessageCode::BACKEND_KEY_DATA => continue,
-            backend::MessageCode::READY_FOR_QUERY => break,
-            c => panic!("unexpected message code {c}"),
-        }
-    }
+    let (mut stream, _) = cb.connect(stream.compat()).await.unwrap();
 
     stream
         .put_parse("stmt", "SELECT $1", [frontend::ParameterKind::Int4])

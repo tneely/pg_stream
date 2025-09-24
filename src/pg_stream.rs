@@ -1,6 +1,6 @@
 use std::io::{Read, Write};
 
-use bytes::{BufMut, BytesMut};
+use bytes::BufMut;
 use futures::{AsyncRead, AsyncWrite};
 
 use crate::{
@@ -145,23 +145,7 @@ impl<S> PgStream<S> {
 
 impl<S: Read> PgStream<S> {
     pub fn read_frame_blocking(&mut self) -> std::io::Result<backend::PgFrame> {
-        let mut buf = [0; 1];
-        self.proto.stream.read_exact(&mut buf)?;
-        let code: backend::MessageCode = u8::from_be_bytes(buf).into();
-
-        let mut buf = [0; 4];
-        self.proto.stream.read_exact(&mut buf)?;
-        let len = u32::from_be_bytes(buf) as usize - size_of::<u32>();
-
-        // FIXME: Check len size before allocating too much space
-        let mut body = BytesMut::with_capacity(len);
-        // SAFETY: The uninitialized bytes are never read
-        unsafe {
-            body.set_len(len);
-        }
-        self.proto.stream.read_exact(&mut body)?;
-
-        Ok(backend::PgFrame::new(code, body))
+        backend::read_frame_blocking(&mut self.proto.stream)
     }
 }
 
