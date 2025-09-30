@@ -165,8 +165,7 @@ pub enum ParameterKind {
 
 impl ParameterKind {
     pub fn as_u32_array(param_kinds: &[ParameterKind]) -> &[u32] {
-        // SAFETY: The internal representation of ParameterKind
-        // is u32
+        // SAFETY: The internal representation of ParameterKind is u32
         unsafe { std::slice::from_raw_parts(param_kinds.as_ptr() as *const u32, param_kinds.len()) }
     }
 }
@@ -223,8 +222,7 @@ pub enum FormatCode {
 
 impl FormatCode {
     pub fn as_u16_array(codes: &[FormatCode]) -> &[u16] {
-        // SAFETY: The internal representation of FormatCode
-        // is u16
+        // SAFETY: The internal representation of FormatCode is u16
         unsafe { std::slice::from_raw_parts(codes.as_ptr() as *const u16, codes.len()) }
     }
 }
@@ -233,6 +231,12 @@ impl From<FormatCode> for u16 {
     fn from(value: FormatCode) -> Self {
         value as u16
     }
+}
+
+pub enum ResultFormat<'a> {
+    Binary,
+    Text,
+    Mixed(&'a [FormatCode]),
 }
 
 #[derive(Debug, Clone, PartialEq)]

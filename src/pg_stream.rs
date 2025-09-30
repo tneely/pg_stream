@@ -6,7 +6,7 @@ use futures::{AsyncRead, AsyncWrite};
 use crate::{
     messages::{
         backend,
-        frontend::{self, ParameterKind},
+        frontend::{self, FormatCode, ParameterKind, ResultFormat},
     },
     pg_stream_proto::PgStreamProto,
     put_cstring,
@@ -63,7 +63,7 @@ impl<S> PgStream<S> {
         portal_name: impl AsRef<str>,
         stmt_name: impl AsRef<str>,
         params: impl AsRef<[frontend::BindParameter]>,
-        result_codes: impl AsRef<[frontend::FormatCode]>,
+        result_format: ResultFormat,
     ) -> &mut Self {
         frontend::MessageCode::BIND.frame(&mut self.proto.buf, |b| {
             put_cstring(b, portal_name.as_ref().as_bytes());
@@ -99,10 +99,20 @@ impl<S> PgStream<S> {
                 param.encode(b);
             }
 
-            let result_codes = result_codes.as_ref();
-            b.put_u16(result_codes.len() as u16);
-            for code in result_codes {
-                b.put_u16((*code).into());
+            match result_format {
+                ResultFormat::Text => {
+                    b.put_u16(0); // Default is text
+                }
+                ResultFormat::Binary => {
+                    b.put_u16(1);
+                    b.put_u16(FormatCode::Binary as u16);
+                }
+                ResultFormat::Mixed(codes) => {
+                    b.put_u16(codes.len() as u16);
+                    for code in codes {
+                        b.put_u16(*code as u16);
+                    }
+                }
             }
         });
         self

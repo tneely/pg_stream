@@ -132,7 +132,12 @@ async fn test_pg_extended_protocol() {
     stream
         .put_parse("stmt", "SELECT $1", [frontend::ParameterKind::Int4])
         .put_describe(frontend::TargetKind::new_stmt("stmt"))
-        .put_bind("", "stmt", [frontend::BindParameter::Int4(1)], [])
+        .put_bind(
+            "",
+            "stmt",
+            [frontend::BindParameter::Int4(1)],
+            frontend::ResultFormat::Text,
+        )
         .put_execute("", None)
         .put_sync();
     stream.flush().await.unwrap();
