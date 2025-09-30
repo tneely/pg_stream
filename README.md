@@ -7,3 +7,11 @@ A low level IO stream for working with the Postgres protocol.
 ```rust
 // TODO
 ```
+
+## Remaining Work
+- [ ] Expand testing
+- [ ] Documentation
+- [ ] Finish startup flow
+- [ ] Publish to cargo
+- [ ] Cleaner futures / tokio support
+- [ ] Backend message parsing
