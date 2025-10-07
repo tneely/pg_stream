@@ -9,9 +9,9 @@ A low level IO stream for working with the Postgres protocol.
 ```
 
 ## Remaining Work
-- [ ] Expand testing
+- [x] Expand testing
 - [ ] Documentation
 - [ ] Finish startup flow
 - [ ] Publish to cargo
-- [ ] Cleaner futures / tokio support
+- [x] Cleaner futures / tokio support
 - [ ] Backend message parsing

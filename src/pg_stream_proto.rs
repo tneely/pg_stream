@@ -1,7 +1,7 @@
 use std::io::Write;
 
 use bytes::{BufMut, BytesMut};
-use futures::{AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use crate::messages::frontend;
 
@@ -118,18 +118,52 @@ impl<S> PgStreamProto<S> {
         frontend::MessageCode::SYNC.frame(&mut self.buf, |_| {});
         self
     }
+
+    pub fn put_fn_call(
+        &mut self,
+        obj_id: u32,
+        format_codes: &[u16],
+        args: &[Option<&[u8]>],
+        result_code: u16,
+    ) -> &mut Self {
+        frontend::MessageCode::FUNCTION_CALL.frame(&mut self.buf, |b| {
+            b.put_u32(obj_id);
+
+            b.put_u16(format_codes.len() as u16);
+            for code in format_codes {
+                b.put_u16(*code);
+            }
+
+            b.put_u16(args.len() as u16);
+            for arg in args {
+                match arg {
+                    Some(arg) => {
+                        b.put_u32(arg.len() as u32);
+                        b.put_slice(arg);
+                    }
+                    None => {
+                        b.put_i32(-1);
+                    }
+                }
+            }
+
+            b.put_u16(result_code);
+        });
+        self
+    }
 }
 
 impl<S: Write> PgStreamProto<S> {
     pub fn flush_blocking(&mut self) -> std::io::Result<()> {
         self.stream.write_all(&self.buf)?;
+        self.buf.clear();
         self.stream.flush()
     }
 }
 
 impl<S: AsyncWrite + Unpin> PgStreamProto<S> {
     pub async fn flush(&mut self) -> std::io::Result<()> {
-        self.stream.write_all(&self.buf).await?;
+        self.stream.write_all_buf(&mut self.buf).await?;
         self.stream.flush().await
     }
 }
@@ -142,21 +176,27 @@ pub(crate) fn put_cstring(b: &mut impl bytes::BufMut, src: &[u8]) {
 
 #[cfg(test)]
 mod tests {
-    use bytes::{BufMut, BytesMut};
-
     use crate::{PgStreamProto, messages::frontend::ParameterKind};
+    use bytes::Buf;
+
+    /// Helper macro for asserting a slice or string from the buffer.
+    /// Usage: `assert_buf_eq!(pg_stream, b"STMT\0");`
+    macro_rules! assert_buf_eq {
+        ($pg_stream:expr, $expected:expr) => {{
+            let len = $expected.len();
+            let got = $pg_stream.buf.copy_to_bytes(len);
+            assert_eq!(&$expected[..], &got[..]);
+        }};
+    }
 
     #[test]
     fn test_put_query() {
         let mut pg_stream = PgStreamProto::from_stream(Vec::<u8>::new());
         pg_stream.put_query(b"SELECT 1");
 
-        let mut expected = BytesMut::new();
-        expected.put_u8(b'Q');
-        expected.put_u32(13);
-        expected.put(&b"SELECT 1\0"[..]);
-
-        assert_eq!(&pg_stream.buf, &expected);
+        assert_eq!(b'Q', pg_stream.buf.get_u8());
+        assert_eq!(13, pg_stream.buf.get_u32());
+        assert_buf_eq!(pg_stream, b"SELECT 1\0");
     }
 
     #[test]
@@ -164,15 +204,12 @@ mod tests {
         let mut pg_stream = PgStreamProto::from_stream(Vec::<u8>::new());
         pg_stream.put_parse(b"STMT", b"SELECT 1", &[ParameterKind::Unspecified as u32]);
 
-        let mut expected = BytesMut::new();
-        expected.put_u8(b'P');
-        expected.put_u32(24);
-        expected.put(&b"STMT\0"[..]);
-        expected.put(&b"SELECT 1\0"[..]);
-        expected.put_u16(1);
-        expected.put_u32(0);
-
-        assert_eq!(&pg_stream.buf, &expected);
+        assert_eq!(b'P', pg_stream.buf.get_u8());
+        assert_eq!(24, pg_stream.buf.get_u32());
+        assert_buf_eq!(pg_stream, b"STMT\0");
+        assert_buf_eq!(pg_stream, b"SELECT 1\0");
+        assert_eq!(1, pg_stream.buf.get_u16());
+        assert_eq!(0, pg_stream.buf.get_u32());
     }
 
     #[test]
@@ -180,13 +217,10 @@ mod tests {
         let mut pg_stream = PgStreamProto::from_stream(Vec::<u8>::new());
         pg_stream.put_describe(b'S', b"STMT");
 
-        let mut expected = BytesMut::new();
-        expected.put_u8(b'D');
-        expected.put_u32(10);
-        expected.put_u8(b'S');
-        expected.put(&b"STMT\0"[..]);
-
-        assert_eq!(&pg_stream.buf, &expected);
+        assert_eq!(b'D', pg_stream.buf.get_u8());
+        assert_eq!(10, pg_stream.buf.get_u32());
+        assert_eq!(b'S', pg_stream.buf.get_u8());
+        assert_buf_eq!(pg_stream, b"STMT\0");
     }
 
     #[test]
@@ -194,13 +228,10 @@ mod tests {
         let mut pg_stream = PgStreamProto::from_stream(Vec::<u8>::new());
         pg_stream.put_describe(b'P', b"PORTAL");
 
-        let mut expected = BytesMut::new();
-        expected.put_u8(b'D');
-        expected.put_u32(12);
-        expected.put_u8(b'P');
-        expected.put(&b"PORTAL\0"[..]);
-
-        assert_eq!(&pg_stream.buf, &expected);
+        assert_eq!(b'D', pg_stream.buf.get_u8());
+        assert_eq!(12, pg_stream.buf.get_u32());
+        assert_eq!(b'P', pg_stream.buf.get_u8());
+        assert_buf_eq!(pg_stream, b"PORTAL\0");
     }
 
     #[test]
@@ -208,26 +239,23 @@ mod tests {
         let mut pg_stream = PgStreamProto::from_stream(Vec::<u8>::new());
         pg_stream.put_bind(b"PORTAL", b"STMT", &[1, 1], &[Some(&[0]), None], &[1]);
 
-        let mut expected = BytesMut::new();
-        expected.put_u8(b'B');
-        expected.put_u32(37);
+        assert_eq!(b'B', pg_stream.buf.get_u8());
+        assert_eq!(37, pg_stream.buf.get_u32());
 
-        expected.put(&b"PORTAL\0"[..]);
-        expected.put(&b"STMT\0"[..]);
+        assert_buf_eq!(pg_stream, b"PORTAL\0");
+        assert_buf_eq!(pg_stream, b"STMT\0");
 
-        expected.put_u16(2);
-        expected.put_u16(1);
-        expected.put_u16(1);
+        assert_eq!(2, pg_stream.buf.get_u16());
+        assert_eq!(1, pg_stream.buf.get_u16());
+        assert_eq!(1, pg_stream.buf.get_u16());
 
-        expected.put_u16(2);
-        expected.put_u32(1);
-        expected.put_u8(0);
-        expected.put_i32(-1);
+        assert_eq!(2, pg_stream.buf.get_u16());
+        assert_eq!(1, pg_stream.buf.get_u32());
+        assert_eq!(0, pg_stream.buf.get_u8());
+        assert_eq!(-1, pg_stream.buf.get_i32());
 
-        expected.put_u16(1);
-        expected.put_u16(1);
-
-        assert_eq!(&pg_stream.buf, &expected);
+        assert_eq!(1, pg_stream.buf.get_u16());
+        assert_eq!(1, pg_stream.buf.get_u16());
     }
 
     #[test]
@@ -235,13 +263,10 @@ mod tests {
         let mut pg_stream = PgStreamProto::from_stream(Vec::<u8>::new());
         pg_stream.put_execute(b"PORTAL", 0);
 
-        let mut expected = BytesMut::new();
-        expected.put_u8(b'E');
-        expected.put_u32(15);
-        expected.put(&b"PORTAL\0"[..]);
-        expected.put_u32(0);
-
-        assert_eq!(&pg_stream.buf, &expected);
+        assert_eq!(b'E', pg_stream.buf.get_u8());
+        assert_eq!(15, pg_stream.buf.get_u32());
+        assert_buf_eq!(pg_stream, b"PORTAL\0");
+        assert_eq!(0, pg_stream.buf.get_u32());
     }
 
     #[test]
@@ -249,13 +274,10 @@ mod tests {
         let mut pg_stream = PgStreamProto::from_stream(Vec::<u8>::new());
         pg_stream.put_close(b'S', b"STMT");
 
-        let mut expected = BytesMut::new();
-        expected.put_u8(b'C');
-        expected.put_u32(10);
-        expected.put_u8(b'S');
-        expected.put(&b"STMT\0"[..]);
-
-        assert_eq!(&pg_stream.buf, &expected);
+        assert_eq!(b'C', pg_stream.buf.get_u8());
+        assert_eq!(10, pg_stream.buf.get_u32());
+        assert_eq!(b'S', pg_stream.buf.get_u8());
+        assert_buf_eq!(pg_stream, b"STMT\0");
     }
 
     #[test]
@@ -263,13 +285,10 @@ mod tests {
         let mut pg_stream = PgStreamProto::from_stream(Vec::<u8>::new());
         pg_stream.put_close(b'P', b"PORTAL");
 
-        let mut expected = BytesMut::new();
-        expected.put_u8(b'C');
-        expected.put_u32(12);
-        expected.put_u8(b'P');
-        expected.put(&b"PORTAL\0"[..]);
-
-        assert_eq!(&pg_stream.buf, &expected);
+        assert_eq!(b'C', pg_stream.buf.get_u8());
+        assert_eq!(12, pg_stream.buf.get_u32());
+        assert_eq!(b'P', pg_stream.buf.get_u8());
+        assert_buf_eq!(pg_stream, b"PORTAL\0");
     }
 
     #[test]
@@ -277,11 +296,8 @@ mod tests {
         let mut pg_stream = PgStreamProto::from_stream(Vec::<u8>::new());
         pg_stream.put_flush();
 
-        let mut expected = BytesMut::new();
-        expected.put_u8(b'H');
-        expected.put_u32(4);
-
-        assert_eq!(&pg_stream.buf, &expected);
+        assert_eq!(b'H', pg_stream.buf.get_u8());
+        assert_eq!(4, pg_stream.buf.get_u32());
     }
 
     #[test]
@@ -289,11 +305,30 @@ mod tests {
         let mut pg_stream = PgStreamProto::from_stream(Vec::<u8>::new());
         pg_stream.put_sync();
 
-        let mut expected = BytesMut::new();
-        expected.put_u8(b'S');
-        expected.put_u32(4);
+        assert_eq!(b'S', pg_stream.buf.get_u8());
+        assert_eq!(4, pg_stream.buf.get_u32());
+    }
 
-        assert_eq!(&pg_stream.buf, &expected);
+    #[test]
+    fn test_put_fn_call() {
+        let mut pg_stream = PgStreamProto::from_stream(Vec::<u8>::new());
+        pg_stream.put_fn_call(101, &[1, 1], &[Some(&[0]), None], 1);
+
+        assert_eq!(b'F', pg_stream.buf.get_u8());
+        assert_eq!(27, pg_stream.buf.get_u32());
+
+        assert_eq!(101, pg_stream.buf.get_u32());
+
+        assert_eq!(2, pg_stream.buf.get_u16());
+        assert_eq!(1, pg_stream.buf.get_u16());
+        assert_eq!(1, pg_stream.buf.get_u16());
+
+        assert_eq!(2, pg_stream.buf.get_u16());
+        assert_eq!(1, pg_stream.buf.get_u32());
+        assert_eq!(0, pg_stream.buf.get_u8());
+        assert_eq!(-1, pg_stream.buf.get_i32());
+
+        assert_eq!(1, pg_stream.buf.get_u16());
     }
 
     #[test]
@@ -303,12 +338,8 @@ mod tests {
         pg_stream.put_sync();
         pg_stream.flush_blocking().unwrap();
 
-        let mut expected = BytesMut::new();
-        expected.put_u8(b'S');
-        expected.put_u32(4);
-
         let (stream, _) = pg_stream.into_parts();
-
-        assert_eq!(&stream, &expected);
+        assert_eq!(b'S', stream[0]);
+        assert_eq!(4, u32::from_be_bytes(stream[1..5].try_into().unwrap()));
     }
 }

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use bytes::{Buf, BufMut, BytesMut};
-use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::{
     PgStream,

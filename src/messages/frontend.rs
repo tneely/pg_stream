@@ -86,7 +86,7 @@ impl std::fmt::Display for MessageCode {
             MessageCode::FUNCTION_CALL => "FunctionCall",
             MessageCode::GSSENC_REQUEST => "GSSENCRequest",
             MessageCode::PARSE => "Parse",
-            #[allow(unreachable_patterns, reason = "messages all use the same char")]
+            #[allow(unreachable_patterns, reason = "including for visibility")]
             MessageCode::PASSWORD_MESSAGE
             | MessageCode::GSS_RESPONSE
             | MessageCode::SASL_RESPONSE => "PasswordMessage|GSSResponse|SASLResponse",
@@ -187,15 +187,9 @@ pub fn frame(buf: &mut BytesMut, payload_fn: impl FnOnce(&mut BytesMut)) {
     buf[base..base + size_of::<u32>()].copy_from_slice(&len.to_be_bytes());
 }
 
-fn raw_prefix(buf: &mut impl BufMut, b: &[u8]) {
+fn len_prefix(buf: &mut impl BufMut, b: &[u8]) {
     buf.put_u32(b.len() as u32);
     buf.put_slice(b);
-}
-
-fn string_prefix(buf: &mut impl BufMut, b: &[u8]) {
-    buf.put_u32(b.len() as u32 + 1);
-    buf.put_slice(b);
-    buf.put_u32(0);
 }
 
 pub enum TargetKind {
@@ -242,8 +236,7 @@ pub enum ResultFormat<'a> {
 #[derive(Debug, Clone, PartialEq)]
 pub enum BindParameter {
     RawBinary(Bytes),
-    RawText(String),
-    String(String),
+    Text(String),
     Bool(bool),
     Int2(i16),
     Int4(i32),
@@ -254,11 +247,13 @@ pub enum BindParameter {
     Null,
 }
 
+pub type FunctionArg = BindParameter;
+
 impl BindParameter {
     /// The parameter format code. Each must presently be zero (text) or one (binary).
     pub fn format_code(&self) -> FormatCode {
         match self {
-            BindParameter::RawText(_) | BindParameter::String(_) => FormatCode::Text,
+            BindParameter::Text(_) => FormatCode::Text,
             _ => FormatCode::Binary,
         }
     }
@@ -267,16 +262,14 @@ impl BindParameter {
     pub fn encode(&self, buf: &mut impl BufMut) {
         match self {
             BindParameter::Null => buf.put_i32(-1),
-            BindParameter::Bool(b) => raw_prefix(buf, &[*b as u8]),
-            BindParameter::Int2(v) => raw_prefix(buf, &v.to_be_bytes()),
-            BindParameter::Int4(v) => raw_prefix(buf, &v.to_be_bytes()),
-            BindParameter::Int8(v) => raw_prefix(buf, &v.to_be_bytes()),
-            BindParameter::Float4(v) => raw_prefix(buf, &v.to_be_bytes()),
-            BindParameter::Float8(v) => raw_prefix(buf, &v.to_be_bytes()),
-            BindParameter::Bytea(b) | BindParameter::RawBinary(b) => raw_prefix(buf, b),
-            BindParameter::String(s) | BindParameter::RawText(s) => {
-                string_prefix(buf, s.as_bytes())
-            }
+            BindParameter::Bool(b) => len_prefix(buf, &[*b as u8]),
+            BindParameter::Int2(v) => len_prefix(buf, &v.to_be_bytes()),
+            BindParameter::Int4(v) => len_prefix(buf, &v.to_be_bytes()),
+            BindParameter::Int8(v) => len_prefix(buf, &v.to_be_bytes()),
+            BindParameter::Float4(v) => len_prefix(buf, &v.to_be_bytes()),
+            BindParameter::Float8(v) => len_prefix(buf, &v.to_be_bytes()),
+            BindParameter::Bytea(b) | BindParameter::RawBinary(b) => len_prefix(buf, b),
+            BindParameter::Text(s) => len_prefix(buf, s.as_bytes()),
         }
     }
 }
@@ -319,13 +312,13 @@ impl From<bool> for BindParameter {
 
 impl From<String> for BindParameter {
     fn from(v: String) -> Self {
-        BindParameter::String(v)
+        BindParameter::Text(v)
     }
 }
 
 impl From<&str> for BindParameter {
     fn from(v: &str) -> Self {
-        BindParameter::String(v.to_string())
+        BindParameter::Text(v.to_string())
     }
 }
 

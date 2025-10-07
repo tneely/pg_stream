@@ -3,7 +3,7 @@
 use std::io::Read;
 
 use bytes::{Bytes, BytesMut};
-use futures::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 // Postgres won't allocate memory greater 1GiB. It probably won't
 // write messages anywhere close to this size either, but this

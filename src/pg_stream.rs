@@ -1,7 +1,7 @@
 use std::io::{Read, Write};
 
 use bytes::BufMut;
-use futures::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::{
     messages::{
@@ -151,6 +151,50 @@ impl<S> PgStream<S> {
         self.proto.put_sync();
         self
     }
+
+    pub fn put_fn_call(
+        &mut self,
+        obj_id: u32,
+        args: impl AsRef<[frontend::FunctionArg]>,
+        result_code: FormatCode,
+    ) -> &mut Self {
+        frontend::MessageCode::FUNCTION_CALL.frame(&mut self.proto.buf, |b| {
+            b.put_u32(obj_id);
+
+            let args = args.as_ref();
+
+            // Format codes can be zero to indicate that there are no arguments
+            // or that the arguments all use the default format (text); or one,
+            // in which case the specified format code is applied to all
+            // arguments; or it can equal the actual number of arguments.
+            match args {
+                [first, rest @ ..]
+                    if rest.iter().all(|p| p.format_code() == first.format_code()) =>
+                {
+                    if first.format_code() == frontend::FormatCode::Text {
+                        b.put_u16(0);
+                    } else {
+                        b.put_u16(1);
+                        b.put_u16(first.format_code() as u16);
+                    }
+                }
+                _ => {
+                    b.put_u16(args.len() as u16);
+                    for arg in args {
+                        b.put_u16(arg.format_code() as u16);
+                    }
+                }
+            };
+
+            b.put_u16(args.len() as u16);
+            for arg in args {
+                arg.encode(b);
+            }
+
+            b.put_u16(result_code as u16);
+        });
+        self
+    }
 }
 
 impl<S: Read> PgStream<S> {
@@ -180,8 +224,6 @@ impl<S: AsyncWrite + Unpin> PgStream<S> {
 #[cfg(test)]
 mod tests {
 
-    use futures::io::AllowStdIo;
-
     use crate::{PgStream, messages::backend::MessageCode};
 
     #[test]
@@ -197,8 +239,7 @@ mod tests {
     #[tokio::test]
     async fn test_read_frame() {
         let stream = vec![b'Z', 0, 0, 0, 5, b'I'];
-        let mut pg_stream =
-            PgStream::<AllowStdIo<&[u8]>>::from_stream(AllowStdIo::new(stream.as_ref()));
+        let mut pg_stream = PgStream::<&[u8]>::from_stream(stream.as_ref());
         let frame = pg_stream.read_frame().await.unwrap();
 
         assert_eq!(frame.code, MessageCode::READY_FOR_QUERY);
