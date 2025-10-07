@@ -1,26 +1,25 @@
 //! Logic for handling and representing Postgres backend messages.
 
 use std::io::Read;
+use std::mem::size_of;
 
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-// Postgres won't allocate memory greater 1GiB. It probably won't
-// write messages anywhere close to this size either, but this
-// gives us a nice upper bound to prevent misbehaving servers
-// from OOMing the client.
-// <https://github.com/postgres/postgres/blob/879c492480d0e9ad8155c4269f95c5e8add41901/src/include/utils/memutils.h#L40>
+/// Maximum allowed frame size from Postgres (1GiB).
+///
+/// This is an upper bound to prevent misbehaving servers from
+/// allocating excessive memory or causing OOMs.
+/// See: <https://github.com/postgres/postgres/blob/879c492480d0e9ad8155c4269f95c5e8add41901/src/include/utils/memutils.h#L40>
 const MAX_FRAME_SIZE_BYTES: usize = 1 << 30; // 1GiB
 
-/// Postgres backend messages are framed by a 1 byte message code,
-/// followed by a u32 integer delineating the length of the rest of
-/// the message.
+/// Postgres backend messages are framed by a 1-byte message code,
+/// followed by a u32 length for the rest of the message body.
 ///
-/// The message code identifies the type of message and format of its
-/// payload.
+/// The message code identifies the type of message and the structure
+/// of its payload.
 ///
-/// For more information, see the official Postgres docs:
-/// <https://www.postgresql.org/docs/current/protocol-message-formats.html>
+/// See: <https://www.postgresql.org/docs/current/protocol-message-formats.html>
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MessageCode(u8);
@@ -115,13 +114,17 @@ impl std::fmt::Debug for MessageCode {
     }
 }
 
+/// A single Postgres protocol frame, containing the message code and the message body.
 #[derive(Debug, Clone)]
 pub struct PgFrame {
+    /// The type of the message
     pub code: MessageCode,
+    /// The payload of the message
     pub body: Bytes,
 }
 
 impl PgFrame {
+    /// Constructs a new `PgFrame` with the given message code and body.
     pub fn new(code: impl Into<MessageCode>, body: impl Into<Bytes>) -> Self {
         Self {
             code: code.into(),
@@ -136,6 +139,7 @@ impl std::fmt::Display for PgFrame {
     }
 }
 
+/// Reads a single Postgres frame from a blocking `Read` stream.
 pub fn read_frame_blocking(mut stream: impl Read) -> std::io::Result<PgFrame> {
     let mut buf = [0; 1];
     stream.read_exact(&mut buf)?;
@@ -151,6 +155,7 @@ pub fn read_frame_blocking(mut stream: impl Read) -> std::io::Result<PgFrame> {
     Ok(PgFrame::new(code, body))
 }
 
+/// Reads a single Postgres frame from an asynchronous `AsyncRead` stream.
 pub async fn read_frame(mut stream: impl AsyncRead + Unpin) -> std::io::Result<PgFrame> {
     let mut buf = [0; 1];
     stream.read_exact(&mut buf).await?;
@@ -181,7 +186,11 @@ unsafe fn init_body(len: usize) -> std::io::Result<BytesMut> {
     Ok(body)
 }
 
-pub fn read_cstring(bytes: &mut Bytes) -> std::io::Result<String> {
+/// Reads a null-terminated string from a `Bytes` buffer.
+///
+/// The returned string excludes the null terminator. Returns an error
+/// if no null terminator is found or if the bytes are not valid UTF-8.
+pub(crate) fn read_cstring(bytes: &mut Bytes) -> std::io::Result<String> {
     let Some(end) = bytes.iter().position(|&b| b == 0) else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,

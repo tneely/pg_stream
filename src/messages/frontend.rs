@@ -2,20 +2,19 @@
 
 use bytes::{BufMut, Bytes, BytesMut};
 
+/// Message for requesting SSL support from the server.
 pub const SSL_REQUEST: &[u8] = &[
     0x00, 0x00, 0x00, 0x08, // length: 8
     0x04, 0xD2, 0x16, 0x2F, // code: 80877103
 ];
 
-/// Postgres frontend messages are framed by a 1 byte message code,
-/// followed by a u32 integer delineating the length of the rest of
-/// the message.
+/// Postgres frontend messages are framed by a 1-byte message code,
+/// followed by a u32 length for the rest of the message.
 ///
-/// The message code identifies the type of message and format of its
-/// payload.
+/// The message code identifies the type of message and the structure
+/// of its payload.
 ///
-/// For more information, see the official Postgres docs:
-/// <https://www.postgresql.org/docs/current/protocol-message-formats.html>
+/// See: <https://www.postgresql.org/docs/current/protocol-message-formats.html>
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MessageCode(u8);
@@ -40,6 +39,7 @@ impl MessageCode {
     pub const SYNC: Self = Self(b'S');
     pub const TERMINATE: Self = Self(b'X');
 
+    /// Writes a message code and its payload to the given buffer.
     #[inline]
     pub fn frame(self, buf: &mut BytesMut, payload_fn: impl FnOnce(&mut BytesMut)) {
         buf.put_u8(self.0);
@@ -164,6 +164,7 @@ pub enum ParameterKind {
 }
 
 impl ParameterKind {
+    /// Returns a slice of the u32 representation of the given `ParameterKind`s.
     pub fn as_u32_array(param_kinds: &[ParameterKind]) -> &[u32] {
         // SAFETY: The internal representation of ParameterKind is u32
         unsafe { std::slice::from_raw_parts(param_kinds.as_ptr() as *const u32, param_kinds.len()) }
@@ -176,6 +177,7 @@ impl From<ParameterKind> for u32 {
     }
 }
 
+/// Writes a length-prefixed payload into a buffer.
 #[inline]
 pub fn frame(buf: &mut BytesMut, payload_fn: impl FnOnce(&mut BytesMut)) {
     let base = buf.len();
@@ -184,29 +186,28 @@ pub fn frame(buf: &mut BytesMut, payload_fn: impl FnOnce(&mut BytesMut)) {
     payload_fn(buf);
 
     let len = (buf.len() - base) as u32;
-    buf[base..base + size_of::<u32>()].copy_from_slice(&len.to_be_bytes());
+    buf[base..base + std::mem::size_of::<u32>()].copy_from_slice(&len.to_be_bytes());
 }
 
-fn len_prefix(buf: &mut impl BufMut, b: &[u8]) {
-    buf.put_u32(b.len() as u32);
-    buf.put_slice(b);
-}
-
+/// A Postgres portal or prepared statement target.
 pub enum TargetKind {
     Portal(String),
     Statement(String),
 }
 
 impl TargetKind {
+    /// Creates a new portal target.
     pub fn new_portal(name: impl Into<String>) -> Self {
         TargetKind::Portal(name.into())
     }
 
+    /// Creates a new statement target.
     pub fn new_stmt(name: impl Into<String>) -> Self {
         TargetKind::Statement(name.into())
     }
 }
 
+/// Parameter format codes for Bind messages.
 #[repr(u16)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FormatCode {
@@ -215,6 +216,7 @@ pub enum FormatCode {
 }
 
 impl FormatCode {
+    /// Returns a slice of the u16 representation of the given format codes.
     pub fn as_u16_array(codes: &[FormatCode]) -> &[u16] {
         // SAFETY: The internal representation of FormatCode is u16
         unsafe { std::slice::from_raw_parts(codes.as_ptr() as *const u16, codes.len()) }
@@ -227,12 +229,14 @@ impl From<FormatCode> for u16 {
     }
 }
 
+/// Result format of query columns.
 pub enum ResultFormat<'a> {
     Binary,
     Text,
     Mixed(&'a [FormatCode]),
 }
 
+/// A Postgres bind parameter.
 #[derive(Debug, Clone, PartialEq)]
 pub enum BindParameter {
     RawBinary(Bytes),
@@ -247,10 +251,11 @@ pub enum BindParameter {
     Null,
 }
 
+/// A Postgres function argument.
 pub type FunctionArg = BindParameter;
 
 impl BindParameter {
-    /// The parameter format code. Each must presently be zero (text) or one (binary).
+    /// Returns the Postgres format code of the parameter.
     pub fn format_code(&self) -> FormatCode {
         match self {
             BindParameter::Text(_) => FormatCode::Text,
@@ -258,8 +263,13 @@ impl BindParameter {
         }
     }
 
-    /// Byte encoding
+    /// Writes the parameter value to the buffer in Postgres wire format.
     pub fn encode(&self, buf: &mut impl BufMut) {
+        fn len_prefix(buf: &mut impl BufMut, b: &[u8]) {
+            buf.put_u32(b.len() as u32);
+            buf.put_slice(b);
+        }
+
         match self {
             BindParameter::Null => buf.put_i32(-1),
             BindParameter::Bool(b) => len_prefix(buf, &[*b as u8]),

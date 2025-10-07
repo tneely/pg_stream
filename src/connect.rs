@@ -8,13 +8,20 @@ use crate::{
     messages::{backend, frontend},
 };
 
+/// Authentication mode for a Postgres connection.
 pub enum AuthenticationMode {
+    /// Trust authentication (no password required).
     Trust,
+    /// Password authentication with the provided password.
     Password(String),
 }
 
 const CURRENT_VERSION: ProtocolVersion = ProtocolVersion::new(3, 0);
 
+/// Postgres protocol version number.
+///
+/// The version is encoded as a 32-bit integer where the upper 16 bits represent
+/// the major version and the lower 16 bits represent the minor version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(transparent)]
 pub struct ProtocolVersion(u32);
@@ -63,13 +70,18 @@ impl std::fmt::Display for ProtocolVersion {
     }
 }
 
+/// Response data from a successful Postgres startup handshake.
 #[derive(Debug, Clone)]
 pub struct StartupResponse {
+    /// Backend process ID for this connection.
     pub process_id: u32,
+    /// Secret key for canceling queries on this connection.
     pub secret_key: u32,
+    /// Server parameters returned during startup (e.g., server_version, client_encoding).
     pub parameters: HashMap<String, String>,
 }
 
+/// Builder for configuring and establishing Postgres connections.
 pub struct ConnectionBuilder {
     database: Option<String>,
     user: String,
@@ -79,6 +91,9 @@ pub struct ConnectionBuilder {
 }
 
 impl ConnectionBuilder {
+    /// Creates a new connection builder with the specified user.
+    ///
+    /// Defaults to trust authentication and protocol version 3.0.
     pub fn new(user: impl Into<String>) -> Self {
         Self {
             database: None,
@@ -89,26 +104,33 @@ impl ConnectionBuilder {
         }
     }
 
-    pub fn database(mut self, db: impl Into<Option<String>>) -> Self {
-        self.database = db.into();
+    /// Sets the database name to connect to.
+    ///
+    /// If not specified, defaults to the username.
+    pub fn database(mut self, db: impl Into<String>) -> Self {
+        self.database = Some(db.into());
         self
     }
 
+    /// Sets the username for authentication.
     pub fn user(mut self, user: impl Into<String>) -> Self {
         self.user = user.into();
         self
     }
 
+    /// Sets the authentication mode.
     pub fn auth(mut self, auth: AuthenticationMode) -> Self {
         self.auth = auth;
         self
     }
 
+    /// Sets the Postgres protocol version.
     pub fn protocol(mut self, protocol: impl Into<ProtocolVersion>) -> Self {
         self.protocol = protocol.into();
         self
     }
 
+    /// Adds a startup parameter option.
     pub fn add_option(mut self, key: impl Into<String>, val: impl Into<String>) -> Self {
         self.options.insert(key.into(), val.into());
         self
@@ -143,6 +165,10 @@ impl ConnectionBuilder {
 }
 
 impl ConnectionBuilder {
+    /// Establishes a Postgres connection with TLS upgrade.
+    ///
+    /// Sends an SSL request to the server and upgrades the connection using the
+    /// provided async upgrade function if the server supports TLS.
     pub async fn connect_with_tls<S, T, F, Fut>(
         &self,
         mut stream: S,
@@ -175,6 +201,10 @@ impl ConnectionBuilder {
         self.connect(stream).await
     }
 
+    /// Establishes a Postgres connection over the provided stream.
+    ///
+    /// Performs the startup handshake, handles authentication, and waits for
+    /// the server to be ready for queries.
     pub async fn connect<S>(&self, mut stream: S) -> std::io::Result<(PgStream<S>, StartupResponse)>
     where
         S: AsyncRead + AsyncWrite + Unpin,

@@ -5,12 +5,17 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use crate::messages::frontend;
 
+/// A low level Postgres protocol stream with buffered message building.
+///
+/// Provides methods to construct Postgres frontend protocol messages
+/// and flush them to the underlying stream.
 pub struct PgStreamProto<S> {
     pub(crate) stream: S,
     pub(crate) buf: BytesMut,
 }
 
 impl<S> PgStreamProto<S> {
+    /// Creates a new protocol stream from an underlying stream.
     pub fn from_stream(stream: S) -> Self {
         PgStreamProto {
             stream,
@@ -18,15 +23,22 @@ impl<S> PgStreamProto<S> {
         }
     }
 
+    /// Consumes the stream and returns the underlying stream and buffered data.
     pub fn into_parts(self) -> (S, Vec<u8>) {
         (self.stream, self.buf.to_vec())
     }
 
+    /// Writes raw bytes directly to the buffer without framing.
     pub fn put_bytes(&mut self, src: &[u8]) -> &mut Self {
         self.buf.put(src);
         self
     }
 
+    /// Adds a simple query message to the buffer.
+    ///
+    /// # Arguments
+    ///
+    /// * `stmt` - SQL statement to execute
     pub fn put_query(&mut self, stmt: &[u8]) -> &mut Self {
         frontend::MessageCode::QUERY.frame(&mut self.buf, |b| {
             put_cstring(b, stmt);
@@ -34,6 +46,13 @@ impl<S> PgStreamProto<S> {
         self
     }
 
+    /// Adds a Parse message to the buffer for prepared statement creation.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - Name for the prepared statement (empty for unnamed)
+    /// * `stmt` - SQL statement text
+    /// * `param_types` - OIDs of parameter data types (empty to infer)
     pub fn put_parse(&mut self, name: &[u8], stmt: &[u8], param_types: &[u32]) -> &mut Self {
         frontend::MessageCode::PARSE.frame(&mut self.buf, |b| {
             put_cstring(b, name);
@@ -47,6 +66,12 @@ impl<S> PgStreamProto<S> {
         self
     }
 
+    /// Adds a Describe message to the buffer.
+    ///
+    /// # Arguments
+    ///
+    /// * `describe_kind` - 'S' for statement or 'P' for portal
+    /// * `name` - Name of the statement or portal to describe
     pub fn put_describe(&mut self, describe_kind: u8, name: &[u8]) -> &mut Self {
         frontend::MessageCode::DESCRIBE.frame(&mut self.buf, |b| {
             b.put_u8(describe_kind);
@@ -55,6 +80,15 @@ impl<S> PgStreamProto<S> {
         self
     }
 
+    /// Adds a Bind message to the buffer for binding parameters to a prepared statement.
+    ///
+    /// # Arguments
+    ///
+    /// * `portal_name` - Name for the portal (empty for unnamed)
+    /// * `stmt_name` - Name of the prepared statement to bind
+    /// * `format_codes` - Format codes for parameters (0=text, 1=binary)
+    /// * `params` - Parameter values (None for NULL)
+    /// * `result_codes` - Format codes for result columns
     pub fn put_bind(
         &mut self,
         portal_name: &[u8],
@@ -93,6 +127,12 @@ impl<S> PgStreamProto<S> {
         self
     }
 
+    /// Adds an Execute message to the buffer for executing a bound portal.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - Name of the portal to execute
+    /// * `max_rows` - Maximum number of rows to return (0 for unlimited)
     pub fn put_execute(&mut self, name: &[u8], max_rows: u32) -> &mut Self {
         frontend::MessageCode::EXECUTE.frame(&mut self.buf, |b| {
             put_cstring(b, name);
@@ -101,6 +141,12 @@ impl<S> PgStreamProto<S> {
         self
     }
 
+    /// Adds a Close message to the buffer.
+    ///
+    /// # Arguments
+    ///
+    /// * `close_kind` - 'S' for statement or 'P' for portal
+    /// * `name` - Name of the statement or portal to close
     pub fn put_close(&mut self, close_kind: u8, name: &[u8]) -> &mut Self {
         frontend::MessageCode::CLOSE.frame(&mut self.buf, |b| {
             b.put_u8(close_kind);
@@ -109,16 +155,26 @@ impl<S> PgStreamProto<S> {
         self
     }
 
+    /// Adds a Flush message to the buffer to force sending buffered messages.
     pub fn put_flush(&mut self) -> &mut Self {
         frontend::MessageCode::FLUSH.frame(&mut self.buf, |_| {});
         self
     }
 
+    /// Adds a Sync message to the buffer to end an extended query protocol sequence.
     pub fn put_sync(&mut self) -> &mut Self {
         frontend::MessageCode::SYNC.frame(&mut self.buf, |_| {});
         self
     }
 
+    /// Adds a function call message to the buffer.
+    ///
+    /// # Arguments
+    ///
+    /// * `obj_id` - OID of the function to call
+    /// * `format_codes` - Format codes for arguments (0=text, 1=binary)
+    /// * `args` - Argument values (None for NULL)
+    /// * `result_code` - Format code for the result (0=text, 1=binary)
     pub fn put_fn_call(
         &mut self,
         obj_id: u32,
@@ -154,6 +210,7 @@ impl<S> PgStreamProto<S> {
 }
 
 impl<S: Write> PgStreamProto<S> {
+    /// Flushes the buffered messages to the stream (blocking).
     pub fn flush_blocking(&mut self) -> std::io::Result<()> {
         self.stream.write_all(&self.buf)?;
         self.buf.clear();
@@ -162,6 +219,7 @@ impl<S: Write> PgStreamProto<S> {
 }
 
 impl<S: AsyncWrite + Unpin> PgStreamProto<S> {
+    /// Flushes the buffered messages to the stream (async).
     pub async fn flush(&mut self) -> std::io::Result<()> {
         self.stream.write_all_buf(&mut self.buf).await?;
         self.stream.flush().await

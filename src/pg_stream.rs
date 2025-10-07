@@ -12,26 +12,44 @@ use crate::{
     put_cstring,
 };
 
+/// High-level Postgres protocol stream with type-safe message construction.
+///
+/// Wraps `PgStreamProto` to provide a more ergonomic API with string types
+/// and higher-level abstractions for Postgres protocol messages.
 pub struct PgStream<S> {
     proto: PgStreamProto<S>,
 }
 
 impl<S> PgStream<S> {
+    /// Creates a new Postgres stream from an underlying stream.
     pub fn from_stream(stream: S) -> Self {
         PgStream {
             proto: PgStreamProto::from_stream(stream),
         }
     }
 
+    /// Consumes the stream and returns the underlying stream and buffered data.
     pub fn into_parts(self) -> (S, Vec<u8>) {
         self.proto.into_parts()
     }
 
+    /// Adds a simple query message to the buffer.
+    ///
+    /// # Arguments
+    ///
+    /// * `stmt` - SQL statement to execute
     pub fn put_query(&mut self, stmt: impl AsRef<str>) -> &mut Self {
         self.proto.put_query(stmt.as_ref().as_bytes());
         self
     }
 
+    /// Adds a Parse message to the buffer for prepared statement creation.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - Name for the prepared statement (empty for unnamed)
+    /// * `stmt` - SQL statement text
+    /// * `param_types` - Parameter data types (empty to infer)
     pub fn put_parse(
         &mut self,
         name: impl AsRef<str>,
@@ -46,6 +64,11 @@ impl<S> PgStream<S> {
         self
     }
 
+    /// Adds a Describe message to the buffer.
+    ///
+    /// # Arguments
+    ///
+    /// * `target` - Portal or statement to describe
     pub fn put_describe(&mut self, target: frontend::TargetKind) -> &mut Self {
         match target {
             frontend::TargetKind::Portal(name) => {
@@ -58,6 +81,14 @@ impl<S> PgStream<S> {
         self
     }
 
+    /// Adds a Bind message to the buffer for binding parameters to a prepared statement.
+    ///
+    /// # Arguments
+    ///
+    /// * `portal_name` - Name for the portal (empty for unnamed)
+    /// * `stmt_name` - Name of the prepared statement to bind
+    /// * `params` - Parameter values with their format codes
+    /// * `result_format` - Desired format for result columns
     pub fn put_bind(
         &mut self,
         portal_name: impl AsRef<str>,
@@ -118,6 +149,12 @@ impl<S> PgStream<S> {
         self
     }
 
+    /// Adds an Execute message to the buffer for executing a bound portal.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - Name of the portal to execute
+    /// * `max_rows` - Maximum number of rows to return (None or 0 for unlimited)
     pub fn put_execute(
         &mut self,
         name: impl AsRef<str>,
@@ -130,6 +167,11 @@ impl<S> PgStream<S> {
         self
     }
 
+    /// Adds a Close message to the buffer.
+    ///
+    /// # Arguments
+    ///
+    /// * `target` - Portal or statement to close
     pub fn put_close(&mut self, target: frontend::TargetKind) -> &mut Self {
         match target {
             frontend::TargetKind::Portal(name) => {
@@ -142,16 +184,25 @@ impl<S> PgStream<S> {
         self
     }
 
+    /// Adds a Flush message to the buffer to force sending buffered messages.
     pub fn put_flush(&mut self) -> &mut Self {
         self.proto.put_flush();
         self
     }
 
+    /// Adds a Sync message to the buffer to end an extended query protocol sequence.
     pub fn put_sync(&mut self) -> &mut Self {
         self.proto.put_sync();
         self
     }
 
+    /// Adds a function call message to the buffer.
+    ///
+    /// # Arguments
+    ///
+    /// * `obj_id` - OID of the function to call
+    /// * `args` - Function arguments
+    /// * `result_code` - Desired format for the result (text or binary)
     pub fn put_fn_call(
         &mut self,
         obj_id: u32,
@@ -198,24 +249,28 @@ impl<S> PgStream<S> {
 }
 
 impl<S: Read> PgStream<S> {
+    /// Reads a backend message frame from the stream (blocking).
     pub fn read_frame_blocking(&mut self) -> std::io::Result<backend::PgFrame> {
         backend::read_frame_blocking(&mut self.proto.stream)
     }
 }
 
 impl<S: AsyncRead + Unpin> PgStream<S> {
+    /// Reads a backend message frame from the stream (async).
     pub async fn read_frame(&mut self) -> std::io::Result<backend::PgFrame> {
         backend::read_frame(&mut self.proto.stream).await
     }
 }
 
 impl<S: Write> PgStream<S> {
+    /// Flushes the buffered messages to the stream (blocking).
     pub fn flush_blocking(&mut self) -> std::io::Result<()> {
         self.proto.flush_blocking()
     }
 }
 
 impl<S: AsyncWrite + Unpin> PgStream<S> {
+    /// Flushes the buffered messages to the stream (async).
     pub async fn flush(&mut self) -> std::io::Result<()> {
         self.proto.flush().await
     }
