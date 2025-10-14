@@ -37,6 +37,7 @@ async fn run_pg() -> &'static PostgreSQL {
                     "
                     CREATE ROLE pw_user WITH LOGIN PASSWORD 'pw';
                     CREATE ROLE md5_user WITH LOGIN PASSWORD 'md5';
+                    CREATE ROLE sha_user WITH LOGIN PASSWORD 'sha';
                     ",
                 )
                 .flush()
@@ -44,7 +45,6 @@ async fn run_pg() -> &'static PostgreSQL {
 
             loop {
                 let frame = stream.read_frame().await?;
-                println!("{frame:?}");
                 if frame.code == backend::MessageCode::READY_FOR_QUERY {
                     break;
                 }
@@ -129,6 +129,15 @@ async fn test_pg_startup_md5() {
     assert_eq!(encoding, "UTF8");
 }
 
+#[tokio::test]
+async fn test_pg_startup_sha() {
+    let pg = run_pg().await;
+    let (_, res) = connect("sha_user", "sha", pg.settings().port).await;
+
+    let encoding = res.parameters.get("client_encoding").unwrap();
+    assert_eq!(encoding, "UTF8");
+}
+
 async fn pem_to_der(pem_path: &str) -> std::io::Result<Vec<u8>> {
     let pem_data = tokio::fs::read_to_string(pem_path).await?;
 
@@ -204,7 +213,6 @@ async fn test_pg_extended_protocol() {
 
     // Expect BindComplete
     let frame = pg_stream.read_frame().await.unwrap();
-    println!("{frame:?}");
     assert_eq!(frame.code, backend::MessageCode::BIND_COMPLETE);
 
     //

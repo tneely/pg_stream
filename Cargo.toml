@@ -7,8 +7,7 @@ edition = "2024"
 bytes = "1.10"
 tokio = { version = "1.47", default-features = false, features = ["io-util"] }
 
-# TODO: Feature flag
-md-5 = "0.10"
+scram = "0.6" # TODO: Find a better library or roll own with choice between aws-lc-rs and ring
 
 [dev-dependencies]
 aws-lc-rs = "1"

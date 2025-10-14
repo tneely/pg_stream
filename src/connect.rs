@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use md5::{Digest, Md5};
+use scram::ScramClient;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::{
@@ -231,7 +231,7 @@ impl ConnectionBuilder {
                     startup_res.secret_key = frame.body.get_u32();
                 }
                 backend::MessageCode::READY_FOR_QUERY => break,
-                c => panic!("unexpected message code {c}, {frame:?}"),
+                code => Err(format!("unexpected message code {code}"))?,
             }
         }
 
@@ -264,37 +264,55 @@ impl ConnectionBuilder {
                     code => Err(format!("unexpected authentication code {code}"))?,
                 }
             }
-            AuthMessage::Md5Password(salt) => {
+            AuthMessage::Sasl(mech) => {
                 let AuthenticationMode::Password(pw) = &self.auth else {
                     return Err(ConnectError::PasswordRequired);
                 };
+
+                let scram = ScramClient::new(&self.user, pw, None);
+                let (scram, client_first) = scram.client_first();
+
                 let mut msg = BytesMut::new();
-                frontend::MessageCode::PASSWORD_MESSAGE.frame(&mut msg, |buf| {
-                    // inner = md5(password || username)
-                    let mut inner_hasher = Md5::new();
-                    inner_hasher.update(pw);
-                    inner_hasher.update(&self.user);
-                    let inner = inner_hasher.finalize();
-                    let inner_hex = format!("{:x}", inner);
-
-                    // outer = md5(inner_hex || salt)
-                    let mut outer_hasher = Md5::new();
-                    outer_hasher.update(inner_hex.as_bytes());
-                    outer_hasher.update(salt);
-                    let outer = outer_hasher.finalize();
-
-                    buf.put_slice(format!("md5{}", format!("{:x}", outer)).as_bytes());
+                frontend::MessageCode::SASL_RESPONSE.frame(&mut msg, |buf| {
+                    buf.put_slice(mech.to_string().as_bytes());
                     buf.put_u8(0);
+                    buf.put_u32(client_first.len() as u32);
+                    buf.put_slice(client_first.as_bytes());
                 });
                 stream.write_all(&msg).await?;
                 stream.flush().await?;
+
+                let res = read_auth_message(stream).await?;
+                let AuthMessage::SaslContinue(server_first) = res else {
+                    return Err(format!("unexpected authentication response {res}"))?;
+                };
+
+                let scram = scram
+                    .handle_server_first(&server_first)
+                    .map_err(|e| format!("scram handshake failed: {e}"))?;
+                let (scram, client_final) = scram.client_final();
+
+                let mut msg = BytesMut::new();
+                frontend::MessageCode::SASL_RESPONSE.frame(&mut msg, |buf| {
+                    buf.put_slice(client_final.as_bytes());
+                });
+                stream.write_all(&msg).await?;
+                stream.flush().await?;
+
+                let res = read_auth_message(stream).await?;
+                let AuthMessage::SaslFinal(server_final) = res else {
+                    return Err(format!("unexpected authentication response {res}"))?;
+                };
+
+                scram
+                    .handle_server_final(&server_final)
+                    .map_err(|e| format!("scram handshake failed: {e}"))?;
 
                 match read_auth_message(stream).await? {
                     AuthMessage::Ok => Ok(()),
                     code => Err(format!("unexpected authentication code {code}"))?,
                 }
-            },
-            Auth
+            }
             code => unimplemented!("oops: {code}"),
         }
     }
@@ -308,7 +326,9 @@ enum AuthMessage {
     Gss,
     GssContinue,
     Sspi,
-    Sasl,
+    Sasl(AuthMechanism),
+    SaslContinue(String),
+    SaslFinal(String),
 }
 
 impl std::fmt::Display for AuthMessage {
@@ -317,11 +337,43 @@ impl std::fmt::Display for AuthMessage {
             AuthMessage::Ok => write!(f, "AuthenticationOk"),
             AuthMessage::KerberosV5 => write!(f, "AuthenticationKerberosV5"),
             AuthMessage::CleartextPassword => write!(f, "AuthenticationCleartextPassword"),
-            AuthMessage::Md5Password(_) => write!(f, "AuthenticationMD5Password"),
+            AuthMessage::Md5Password(_salt) => write!(f, "AuthenticationMD5Password"),
             AuthMessage::Gss => write!(f, "AuthenticationGSS"),
             AuthMessage::GssContinue => write!(f, "AuthenticationGSSContinue"),
             AuthMessage::Sspi => write!(f, "AuthenticationSSPI"),
-            AuthMessage::Sasl => write!(f, "AuthenticationSASL"),
+            AuthMessage::Sasl(mech) => write!(f, "AuthenticationSASL({mech})"),
+            AuthMessage::SaslContinue(_) => write!(f, "AuthenticationSASLContinue"),
+            AuthMessage::SaslFinal(_) => write!(f, "AuthenticationSASLContinue"),
+        }
+    }
+}
+
+enum AuthMechanism {
+    ScramSha256,
+    // ScramSha256Plus,
+    // OAuthBearer,
+}
+
+impl std::fmt::Display for AuthMechanism {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::ScramSha256 => "SCRAM-SHA-256",
+            // Self::ScramSha256Plus => "SCRAM-SHA-256-PLUS",
+            // Self::OAuthBearer => "OAUTHBEARER",
+        };
+        write!(f, "{name}")
+    }
+}
+
+impl TryFrom<&str> for AuthMechanism {
+    type Error = ConnectError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "SCRAM-SHA-256" => Ok(AuthMechanism::ScramSha256),
+            // "SCRAM-SHA-256-PLUS" => Ok(AuthMechanism::ScramSha256Plus),
+            // "OAUTHBEARER" => Ok(AuthMechanism::OAuthBearer),
+            _ => Err(format!("unsupported authentication mechanism {value}"))?,
         }
     }
 }
@@ -352,7 +404,22 @@ where
                 7 => AuthMessage::Gss,
                 8 => AuthMessage::GssContinue,
                 9 => AuthMessage::Sspi,
-                10 => AuthMessage::Sasl,
+                10 => {
+                    let mech = msg.body[4..]
+                        .split(|b| *b == 0)
+                        .map(String::from_utf8_lossy)
+                        .find_map(|m| AuthMechanism::try_from(m.as_ref()).ok())
+                        .ok_or("no supported authentication mechanisms")?;
+                    AuthMessage::Sasl(mech)
+                }
+                11 => {
+                    let resp = &msg.body[4..];
+                    AuthMessage::SaslContinue(String::from_utf8_lossy(resp).to_string())
+                }
+                12 => {
+                    let resp = &msg.body[4..];
+                    AuthMessage::SaslFinal(String::from_utf8_lossy(resp).to_string())
+                }
                 auth_code => Err(format!("unexpected auth response code {auth_code}",))?,
             };
             Ok(msg)
