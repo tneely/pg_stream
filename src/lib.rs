@@ -11,7 +11,6 @@
 //! - **Connection establishment** via [`ConnectionBuilder`] with support for
 //!   authentication and TLS
 //! - **Message construction** using the fluent API on [`PgStream`]
-//! - **Protocol I/O** with both async and blocking support
 //! - **Frame reading** from backend responses
 //!
 //! # Example: Simple Query
@@ -20,7 +19,7 @@
 //! use pg_stream::{ConnectionBuilder, AuthenticationMode};
 //!
 //! # #[tokio::main]
-//! # async fn main() -> std::io::Result<()> {
+//! # async fn main() -> pg_stream::ConnectResult<()> {
 //! let stream = tokio::net::TcpStream::connect("localhost:5432").await?;
 //!
 //! let (mut conn, startup) = ConnectionBuilder::new("postgres")
@@ -135,14 +134,15 @@
 //!
 //! # Feature Flags
 //!
-//! Currently, this crate has no optional features. Both async (tokio) and
-//! blocking I/O support are always available.
+//! Currently, this crate has no optional features.
 
 mod connect;
+mod error;
 pub mod messages;
 mod pg_stream;
 mod pg_stream_proto;
 
 pub use connect::*;
+pub use error::*;
 pub use pg_stream::*;
 pub use pg_stream_proto::*;

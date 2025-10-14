@@ -1,5 +1,3 @@
-use std::io::{Read, Write};
-
 use bytes::BufMut;
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -248,24 +246,10 @@ impl<S> PgStream<S> {
     }
 }
 
-impl<S: Read> PgStream<S> {
-    /// Reads a backend message frame from the stream (blocking).
-    pub fn read_frame_blocking(&mut self) -> std::io::Result<backend::PgFrame> {
-        backend::read_frame_blocking(&mut self.proto.stream)
-    }
-}
-
 impl<S: AsyncRead + Unpin> PgStream<S> {
     /// Reads a backend message frame from the stream (async).
     pub async fn read_frame(&mut self) -> std::io::Result<backend::PgFrame> {
         backend::read_frame(&mut self.proto.stream).await
-    }
-}
-
-impl<S: Write> PgStream<S> {
-    /// Flushes the buffered messages to the stream (blocking).
-    pub fn flush_blocking(&mut self) -> std::io::Result<()> {
-        self.proto.flush_blocking()
     }
 }
 
@@ -278,18 +262,7 @@ impl<S: AsyncWrite + Unpin> PgStream<S> {
 
 #[cfg(test)]
 mod tests {
-
     use crate::{PgStream, messages::backend::MessageCode};
-
-    #[test]
-    fn test_read_frame_blocking() {
-        let stream = vec![b'Z', 0, 0, 0, 5, b'I'];
-        let mut pg_stream = PgStream::<&[u8]>::from_stream(stream.as_ref());
-        let frame = pg_stream.read_frame_blocking().unwrap();
-
-        assert_eq!(frame.code, MessageCode::READY_FOR_QUERY);
-        assert_eq!(frame.body.as_ref(), &[b'I']);
-    }
 
     #[tokio::test]
     async fn test_read_frame() {

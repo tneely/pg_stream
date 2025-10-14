@@ -1,6 +1,5 @@
 //! Logic for handling and representing Postgres backend messages.
 
-use std::io::Read;
 use std::mem::size_of;
 
 use bytes::{Bytes, BytesMut};
@@ -137,22 +136,6 @@ impl std::fmt::Display for PgFrame {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}: {:?}", self.code, self.body)
     }
-}
-
-/// Reads a single Postgres frame from a blocking `Read` stream.
-pub fn read_frame_blocking(mut stream: impl Read) -> std::io::Result<PgFrame> {
-    let mut buf = [0; 1];
-    stream.read_exact(&mut buf)?;
-    let code: MessageCode = u8::from_be_bytes(buf).into();
-
-    let mut buf = [0; 4];
-    stream.read_exact(&mut buf)?;
-    let len = u32::from_be_bytes(buf) as usize - size_of::<u32>();
-    // SAFETY: The uninitialized bytes are never read
-    let mut body = unsafe { init_body(len)? };
-    stream.read_exact(&mut body)?;
-
-    Ok(PgFrame::new(code, body))
 }
 
 /// Reads a single Postgres frame from an asynchronous `AsyncRead` stream.

@@ -1334,6 +1334,7 @@ dependencies = [
  "base64",
  "bytes",
  "ctor",
+ "md-5",
  "postgresql_commands",
  "postgresql_embedded",
  "rustls",

@@ -9,7 +9,6 @@ A low-level, zero-overhead Rust implementation of the Postgres wire protocol.
 ## Features
 
 - **Zero-copy protocol handling** - Direct buffer manipulation for maximum performance
-- **Async and blocking I/O** - Support for both `tokio` async and standard blocking operations
 - **TLS support** - Built-in SSL/TLS negotiation with custom upgrade functions
 - **Extended query protocol** - Full support for prepared statements, portals, and parameter binding
 - **Function calls** - Direct invocation of Postgres functions via protocol messages
@@ -22,7 +21,7 @@ A low-level, zero-overhead Rust implementation of the Postgres wire protocol.
 use pg_proto::{ConnectionBuilder, AuthenticationMode};
 
 #[tokio::main]
-async fn main() -> std::io::Result<()> {
+async fn main() -> pg_stream::ConnectResult<()> {
     let stream = tokio::net::TcpStream::connect("localhost:5432").await?;
     
     let (mut conn, startup) = ConnectionBuilder::new("postgres")
@@ -168,3 +167,5 @@ This crate is designed for scenarios where you need maximum control and minimum 
 - [ ] Finish startup flow
 - [ ] Publish to cargo
 - [ ] Backend message parsing
+- [ ] Feature flag auth / connection builder
+- [ ] Organize connect.rs better

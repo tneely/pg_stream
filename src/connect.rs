@@ -1,14 +1,19 @@
 use std::collections::HashMap;
 
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
+use md5::{Digest, Md5};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::{
-    PgStream,
-    messages::{backend, frontend},
+    ConnectError, ConnectResult, PgStream,
+    messages::{
+        backend::{self},
+        frontend,
+    },
 };
 
 /// Authentication mode for a Postgres connection.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AuthenticationMode {
     /// Trust authentication (no password required).
     Trust,
@@ -136,7 +141,7 @@ impl ConnectionBuilder {
         self
     }
 
-    fn as_startup_message(&self) -> Vec<u8> {
+    fn as_startup_message(&self) -> Bytes {
         let mut buf = BytesMut::new();
         frontend::frame(&mut buf, |buf| {
             buf.put_u32(self.protocol.into());
@@ -160,11 +165,9 @@ impl ConnectionBuilder {
             buf.put_u8(0);
         });
 
-        buf.to_vec()
+        buf.freeze()
     }
-}
 
-impl ConnectionBuilder {
     /// Establishes a Postgres connection with TLS upgrade.
     ///
     /// Sends an SSL request to the server and upgrades the connection using the
@@ -173,7 +176,7 @@ impl ConnectionBuilder {
         &self,
         mut stream: S,
         upgrade_fn: F,
-    ) -> std::io::Result<(PgStream<T>, StartupResponse)>
+    ) -> ConnectResult<(PgStream<T>, StartupResponse)>
     where
         S: AsyncRead + AsyncWrite + Unpin,
         T: AsyncRead + AsyncWrite + Unpin,
@@ -185,18 +188,16 @@ impl ConnectionBuilder {
 
         let mut buf = [0; 1];
         stream.read_exact(&mut buf).await?;
-        let res = u8::from_be_bytes(buf) as char;
+        let res = u8::from_be_bytes(buf);
+
+        const SSL_SUCCESS: u8 = b'S';
+        const SSL_FAILURE: u8 = b'N';
 
         let stream = match res {
-            'S' => upgrade_fn(stream).await,
-            'N' => Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "TLS is not supported".to_string(),
-            )),
-            _ => Err(std::io::Error::other(format!(
-                "unexpected SSL response code '{res}'"
-            ))),
-        }?;
+            SSL_SUCCESS => upgrade_fn(stream).await?,
+            SSL_FAILURE => Err(ConnectError::TlsUnsupported)?,
+            _ => Err(format!("unexpected SSL response code '{res}'"))?,
+        };
 
         self.connect(stream).await
     }
@@ -205,79 +206,11 @@ impl ConnectionBuilder {
     ///
     /// Performs the startup handshake, handles authentication, and waits for
     /// the server to be ready for queries.
-    pub async fn connect<S>(&self, mut stream: S) -> std::io::Result<(PgStream<S>, StartupResponse)>
+    pub async fn connect<S>(&self, mut stream: S) -> ConnectResult<(PgStream<S>, StartupResponse)>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
-        let startup = self.as_startup_message();
-        stream.write_all(&startup).await?;
-        stream.flush().await?;
-
-        // FIXME: Move loop to state machine once I have a better understanding
-        // of how the auth flow works
-        loop {
-            let message = backend::read_frame(&mut stream).await.expect("ok");
-
-            const AUTH_OK: &[u8] = &0u32.to_be_bytes();
-            const AUTH_KERBEROS_V5: &[u8] = &2u32.to_be_bytes();
-            const AUTH_CLEARTEXT_PW: &[u8] = &3u32.to_be_bytes();
-            const AUTH_MD5_PW: &[u8] = &5u32.to_be_bytes();
-            const AUTH_GSS: &[u8] = &7u32.to_be_bytes();
-            const AUTH_SSPI: &[u8] = &9u32.to_be_bytes();
-            const AUTH_SASL: &[u8] = &10u32.to_be_bytes();
-
-            match message.code {
-                backend::MessageCode::ERROR_RESPONSE => {
-                    panic!("handle me: {}", String::from_utf8_lossy(&message.body));
-                }
-                backend::MessageCode::AUTHENTICATION => match &message.body[..4] {
-                    AUTH_OK => break,
-                    AUTH_CLEARTEXT_PW => match &self.auth {
-                        AuthenticationMode::Password(pw) => {
-                            let mut msg = BytesMut::new();
-                            frontend::MessageCode::PASSWORD_MESSAGE.frame(&mut msg, |buf| {
-                                buf.put_slice(pw.as_bytes());
-                                buf.put_u8(0);
-                            });
-                            stream.write_all(&msg).await?;
-                            stream.flush().await?;
-                        }
-                        _ => {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::InvalidInput,
-                                "password required",
-                            ));
-                        }
-                    },
-                    AUTH_SASL => {
-                        unimplemented!("SASL not supported yet")
-                    }
-                    AUTH_KERBEROS_V5 => {
-                        unimplemented!("Kerberos not supported yet")
-                    }
-                    AUTH_MD5_PW => {
-                        unimplemented!("MD5 not supported yet")
-                    }
-                    AUTH_GSS => {
-                        unimplemented!("GSS not supported yet")
-                    }
-                    AUTH_SSPI => {
-                        unimplemented!("SSPI not supported yet")
-                    }
-                    auth_code => {
-                        return Err(std::io::Error::other(format!(
-                            "unexpected auth response code {}",
-                            u32::from_be_bytes(auth_code.try_into().unwrap())
-                        )));
-                    }
-                },
-                code => {
-                    return Err(std::io::Error::other(format!(
-                        "unexpected message code {code}",
-                    )));
-                }
-            }
-        }
+        self.startup(&mut stream).await?;
 
         let mut startup_res = StartupResponse {
             process_id: 0,
@@ -298,11 +231,133 @@ impl ConnectionBuilder {
                     startup_res.secret_key = frame.body.get_u32();
                 }
                 backend::MessageCode::READY_FOR_QUERY => break,
-                c => panic!("unexpected message code {c}"),
+                c => panic!("unexpected message code {c}, {frame:?}"),
             }
         }
 
         Ok((PgStream::from_stream(stream), startup_res))
+    }
+
+    async fn startup<S>(&self, stream: &mut S) -> ConnectResult<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let startup_msg = self.as_startup_message();
+        stream.write_all(&startup_msg).await?;
+        stream.flush().await?;
+        match read_auth_message(stream).await? {
+            AuthMessage::Ok => Ok(()),
+            AuthMessage::CleartextPassword => {
+                let AuthenticationMode::Password(pw) = &self.auth else {
+                    return Err(ConnectError::PasswordRequired);
+                };
+                let mut msg = BytesMut::new();
+                frontend::MessageCode::PASSWORD_MESSAGE.frame(&mut msg, |buf| {
+                    buf.put_slice(pw.as_bytes());
+                    buf.put_u8(0);
+                });
+                stream.write_all(&msg).await?;
+                stream.flush().await?;
+
+                match read_auth_message(stream).await? {
+                    AuthMessage::Ok => Ok(()),
+                    code => Err(format!("unexpected authentication code {code}"))?,
+                }
+            }
+            AuthMessage::Md5Password(salt) => {
+                let AuthenticationMode::Password(pw) = &self.auth else {
+                    return Err(ConnectError::PasswordRequired);
+                };
+                let mut msg = BytesMut::new();
+                frontend::MessageCode::PASSWORD_MESSAGE.frame(&mut msg, |buf| {
+                    // inner = md5(password || username)
+                    let mut inner_hasher = Md5::new();
+                    inner_hasher.update(pw);
+                    inner_hasher.update(&self.user);
+                    let inner = inner_hasher.finalize();
+                    let inner_hex = format!("{:x}", inner);
+
+                    // outer = md5(inner_hex || salt)
+                    let mut outer_hasher = Md5::new();
+                    outer_hasher.update(inner_hex.as_bytes());
+                    outer_hasher.update(salt);
+                    let outer = outer_hasher.finalize();
+
+                    buf.put_slice(format!("md5{}", format!("{:x}", outer)).as_bytes());
+                    buf.put_u8(0);
+                });
+                stream.write_all(&msg).await?;
+                stream.flush().await?;
+
+                match read_auth_message(stream).await? {
+                    AuthMessage::Ok => Ok(()),
+                    code => Err(format!("unexpected authentication code {code}"))?,
+                }
+            },
+            Auth
+            code => unimplemented!("oops: {code}"),
+        }
+    }
+}
+
+enum AuthMessage {
+    Ok,
+    KerberosV5,
+    CleartextPassword,
+    Md5Password([u8; 4]),
+    Gss,
+    GssContinue,
+    Sspi,
+    Sasl,
+}
+
+impl std::fmt::Display for AuthMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuthMessage::Ok => write!(f, "AuthenticationOk"),
+            AuthMessage::KerberosV5 => write!(f, "AuthenticationKerberosV5"),
+            AuthMessage::CleartextPassword => write!(f, "AuthenticationCleartextPassword"),
+            AuthMessage::Md5Password(_) => write!(f, "AuthenticationMD5Password"),
+            AuthMessage::Gss => write!(f, "AuthenticationGSS"),
+            AuthMessage::GssContinue => write!(f, "AuthenticationGSSContinue"),
+            AuthMessage::Sspi => write!(f, "AuthenticationSSPI"),
+            AuthMessage::Sasl => write!(f, "AuthenticationSASL"),
+        }
+    }
+}
+
+async fn read_auth_message<S>(stream: &mut S) -> ConnectResult<AuthMessage>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let msg = backend::read_frame(stream).await?;
+
+    match msg.code {
+        backend::MessageCode::ERROR_RESPONSE => {
+            let pg_err = msg.try_into().expect("is an error response");
+            Err(ConnectError::Server(pg_err))
+        }
+        backend::MessageCode::AUTHENTICATION => {
+            let auth_code = u32::from_be_bytes(msg.body[..4].try_into().unwrap());
+            let msg = match auth_code {
+                0 => AuthMessage::Ok,
+                2 => AuthMessage::KerberosV5,
+                3 => AuthMessage::CleartextPassword,
+                5 => {
+                    let salt = msg.body[4..]
+                        .try_into()
+                        .map_err(|_| "unexpected body length in md5 password challenge")?;
+                    AuthMessage::Md5Password(salt)
+                }
+                7 => AuthMessage::Gss,
+                8 => AuthMessage::GssContinue,
+                9 => AuthMessage::Sspi,
+                10 => AuthMessage::Sasl,
+                auth_code => Err(format!("unexpected auth response code {auth_code}",))?,
+            };
+            Ok(msg)
+        }
+        code => Err(format!("unexpected message code {code}"))?,
     }
 }
 

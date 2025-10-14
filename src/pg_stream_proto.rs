@@ -1,5 +1,3 @@
-use std::io::Write;
-
 use bytes::{BufMut, BytesMut};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
@@ -209,15 +207,6 @@ impl<S> PgStreamProto<S> {
     }
 }
 
-impl<S: Write> PgStreamProto<S> {
-    /// Flushes the buffered messages to the stream (blocking).
-    pub fn flush_blocking(&mut self) -> std::io::Result<()> {
-        self.stream.write_all(&self.buf)?;
-        self.buf.clear();
-        self.stream.flush()
-    }
-}
-
 impl<S: AsyncWrite + Unpin> PgStreamProto<S> {
     /// Flushes the buffered messages to the stream (async).
     pub async fn flush(&mut self) -> std::io::Result<()> {
@@ -387,17 +376,5 @@ mod tests {
         assert_eq!(-1, pg_stream.buf.get_i32());
 
         assert_eq!(1, pg_stream.buf.get_u16());
-    }
-
-    #[test]
-    fn test_flush_blocking() {
-        let stream = Vec::<u8>::new();
-        let mut pg_stream = PgStreamProto::from_stream(stream);
-        pg_stream.put_sync();
-        pg_stream.flush_blocking().unwrap();
-
-        let (stream, _) = pg_stream.into_parts();
-        assert_eq!(b'S', stream[0]);
-        assert_eq!(4, u32::from_be_bytes(stream[1..5].try_into().unwrap()));
     }
 }

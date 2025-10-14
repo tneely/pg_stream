@@ -26,9 +26,29 @@ async fn run_pg() -> &'static PostgreSQL {
             let mut pg = PostgreSQL::new(settings);
             pg.setup().await?;
             tokio::fs::copy("tests/data/pg/postgresql.conf", "data/db/postgresql.conf").await?;
+            tokio::fs::copy("tests/data/pg/pg_hba.conf", "data/db/pg_hba.conf").await?;
             tokio::fs::copy("tests/data/certs/server.crt", "data/db/server.crt").await?;
             tokio::fs::copy("tests/data/certs/server.key", "data/db/server.key").await?;
             pg.start().await?;
+
+            let (mut stream, _) = connect_pg(&pg).await;
+            stream
+                .put_query(
+                    "
+                    CREATE ROLE pw_user WITH LOGIN PASSWORD 'pw';
+                    CREATE ROLE md5_user WITH LOGIN PASSWORD 'md5';
+                    ",
+                )
+                .flush()
+                .await?;
+
+            loop {
+                let frame = stream.read_frame().await?;
+                println!("{frame:?}");
+                if frame.code == backend::MessageCode::READY_FOR_QUERY {
+                    break;
+                }
+            }
 
             Ok::<PostgreSQL, postgresql_embedded::Error>(pg)
         })
@@ -72,8 +92,18 @@ async fn connect_pg(pg: &PostgreSQL) -> (PgStream<TcpStream>, StartupResponse) {
         password,
         port,
         ..
-    } = pg.settings().clone();
-    let cb = ConnectionBuilder::new(username).auth(AuthenticationMode::Password(password));
+    } = pg.settings();
+    connect(username, password, *port).await
+}
+
+async fn connect(
+    username: &str,
+    password: &str,
+    port: u16,
+) -> (PgStream<TcpStream>, StartupResponse) {
+    let cb = ConnectionBuilder::new(username)
+        .database("postgres")
+        .auth(AuthenticationMode::Password(password.to_string()));
 
     let addr = format!("localhost:{port}");
     let stream = TcpStream::connect(addr).await.unwrap();
@@ -82,9 +112,18 @@ async fn connect_pg(pg: &PostgreSQL) -> (PgStream<TcpStream>, StartupResponse) {
 }
 
 #[tokio::test]
-async fn test_pg_startup_tcp() {
+async fn test_pg_startup_plaintext() {
     let pg = run_pg().await;
-    let (_, res) = connect_pg(&pg).await;
+    let (_, res) = connect("pw_user", "pw", pg.settings().port).await;
+
+    let encoding = res.parameters.get("client_encoding").unwrap();
+    assert_eq!(encoding, "UTF8");
+}
+
+#[tokio::test]
+async fn test_pg_startup_md5() {
+    let pg = run_pg().await;
+    let (_, res) = connect("md5_user", "md5", pg.settings().port).await;
 
     let encoding = res.parameters.get("client_encoding").unwrap();
     assert_eq!(encoding, "UTF8");
