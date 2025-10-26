@@ -3,9 +3,13 @@ use std::hint::black_box;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 
 use pg_stream::{
-    messages::{backend, frontend::{
-        BindParameter, FormatCode, FunctionArg, ParameterKind, ResultFormat, TargetKind,
-    }}, PgStream
+    PgStream,
+    messages::{
+        backend,
+        frontend::{
+            BindParameter, FormatCode, FunctionArg, ParameterKind, ResultFormat, TargetKind,
+        },
+    },
 };
 
 fn bench_put_query(c: &mut Criterion) {

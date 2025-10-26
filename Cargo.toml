@@ -2,6 +2,13 @@
 name = "pg_stream"
 version = "0.1.0"
 edition = "2024"
+authors = ["Taylor Neely <tneely417@gmail.com>"]
+description = "A low-level, zero-overhead Rust implementation of the Postgres wire protocol."
+repository = "https://github.com/tneely/pg_stream"
+readme = "README.md"
+license-file = "LICENSE"
+keywords = ["postgresql"]
+categories = ["database"]
 
 [features]
 default = ["startup"] 
