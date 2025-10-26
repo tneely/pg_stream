@@ -128,7 +128,6 @@
 //! This is a low-level crate with minimal safety guarantees:
 //!
 //! - **No SQL injection protection** - sanitize your inputs
-//! - **Incomplete error handling** - some errors currently panic (see TODOs)
 //! - **Manual resource management** - close your statements and portals
 //! - **No connection pooling** - manage connections yourself
 //!

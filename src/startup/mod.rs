@@ -5,10 +5,12 @@ use scram::ScramClient;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::{
-    startup::auth::{read_auth_message, AuthMessage}, messages::{
+    PgStream,
+    messages::{
         backend::{self},
         frontend,
-    }, PgStream
+    },
+    startup::auth::{AuthMessage, read_auth_message},
 };
 
 mod auth;
@@ -92,8 +94,6 @@ pub struct StartupResponse {
 
 /// Builder for configuring and establishing Postgres connections.
 pub struct ConnectionBuilder {
-    database: Option<String>,
-    user: String,
     auth: AuthenticationMode,
     protocol: ProtocolVersion,
     options: HashMap<String, String>,
@@ -104,33 +104,41 @@ impl ConnectionBuilder {
     ///
     /// Defaults to trust authentication and protocol version 3.0.
     pub fn new(user: impl Into<String>) -> Self {
+        let user = user.into();
+
+        let mut options = HashMap::new();
+        options.insert("application_name".into(), "pg_stream".into());
+        options.insert("database".into(), user.clone());
+        options.insert("user".into(), user);
+
         Self {
-            database: None,
-            user: user.into(),
             auth: AuthenticationMode::Trust,
             protocol: CURRENT_VERSION,
-            options: HashMap::new(),
+            options,
         }
     }
 
     /// Sets the database name to connect to.
     ///
     /// If not specified, defaults to the username.
-    pub fn database(mut self, db: impl Into<String>) -> Self {
-        self.database = Some(db.into());
-        self
+    pub fn database(self, db: impl Into<String>) -> Self {
+        self.add_option("database", db.into())
     }
 
     /// Sets the username for authentication.
-    pub fn user(mut self, user: impl Into<String>) -> Self {
-        self.user = user.into();
-        self
+    pub fn user(self, user: impl Into<String>) -> Self {
+        self.add_option("user", user.into())
     }
 
     /// Sets the authentication mode.
     pub fn auth(mut self, auth: AuthenticationMode) -> Self {
         self.auth = auth;
         self
+    }
+
+    /// Sets the application name.
+    pub fn application_name(self, app: impl Into<String>) -> Self {
+        self.add_option("application_name", app.into())
     }
 
     /// Sets the Postgres protocol version.
@@ -145,26 +153,21 @@ impl ConnectionBuilder {
         self
     }
 
+    fn get_user(&self) -> &str {
+        self.options.get("user").expect("user should always be set")
+    }
+
     fn as_startup_message(&self) -> Bytes {
         let mut buf = BytesMut::new();
         frontend::frame(&mut buf, |buf| {
             buf.put_u32(self.protocol.into());
 
-            buf.put_slice("user".as_bytes());
-            buf.put_u8(0);
-            buf.put_slice(self.user.as_bytes());
-            buf.put_u8(0);
-
-            buf.put_slice("database".as_bytes());
-            buf.put_u8(0);
-            if let Some(db) = &self.database {
-                buf.put_slice(db.as_bytes());
-            } else {
-                buf.put_slice(self.user.as_bytes());
+            for (key, val) in &self.options {
+                buf.put_slice(key.as_bytes());
+                buf.put_u8(0);
+                buf.put_slice(val.as_bytes());
+                buf.put_u8(0);
             }
-            buf.put_u8(0);
-
-            // TODO: The rest of the startup message
 
             buf.put_u8(0);
         });
@@ -273,7 +276,7 @@ impl ConnectionBuilder {
                     return Err(Error::PasswordRequired);
                 };
 
-                let scram = ScramClient::new(&self.user, pw, None);
+                let scram = ScramClient::new(&self.get_user(), pw, None);
                 let (scram, client_first) = scram.client_first();
 
                 let mut msg = BytesMut::new();

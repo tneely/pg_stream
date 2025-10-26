@@ -18,10 +18,10 @@ A low-level, zero-overhead Rust implementation of the Postgres wire protocol.
 ## Quick Start
 
 ```rust
-use pg_proto::{ConnectionBuilder, AuthenticationMode};
+use pg_proto::startup::{ConnectionBuilder, AuthenticationMode};
 
 #[tokio::main]
-async fn main() -> pg_stream::connect::Result<()> {
+async fn main() -> pg_stream::startup::Result<()> {
     let stream = tokio::net::TcpStream::connect("localhost:5432").await?;
     
     let (mut conn, startup) = ConnectionBuilder::new("postgres")
@@ -159,10 +159,5 @@ This crate is designed for scenarios where you need maximum control and minimum 
 
 - **No SQL injection protection** - You are responsible for sanitizing inputs
 - **No connection pooling** - Single connection per `PgStream`
-- **Limited error handling** - Protocol errors may panic (marked with TODOs)
 - **Manual resource management** - You must close statements and portals
-- **Incomplete auth support** - Only Trust and cleartext password
-
-## Remaining Work
-- [ ] Finish startup flow
-- [ ] Publish to cargo
+- **Incomplete auth support** - Only Trust, scram, and cleartext password

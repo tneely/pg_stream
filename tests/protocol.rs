@@ -3,8 +3,8 @@ use base64::prelude::BASE64_STANDARD;
 use pg_stream::messages::frontend;
 use pg_stream::{
     PgErrorResponse, PgStream,
-    startup::{AuthenticationMode, ConnectionBuilder, StartupResponse},
     messages::backend,
+    startup::{AuthenticationMode, ConnectionBuilder, StartupResponse},
 };
 use postgresql_embedded::{PostgreSQL, Settings, Status};
 use std::path::PathBuf;
@@ -115,12 +115,25 @@ async fn connect(
 }
 
 #[tokio::test]
-async fn test_pg_startup_plaintext() {
+async fn test_pg_startup_options() {
     let pg = run_pg().await;
-    let (_, res) = connect("pw_user", "pw", pg.settings().port).await;
+
+    let cb = ConnectionBuilder::new("pw_user")
+        .database("postgres")
+        .application_name("test")
+        .add_option("client_encoding", "LATIN1")
+        .auth(AuthenticationMode::Password("pw".to_string()));
+
+    let addr = format!("localhost:{}", pg.settings().port);
+    let stream = TcpStream::connect(addr).await.unwrap();
+    stream.set_nodelay(true).unwrap();
+    let (_, res) = cb.connect(stream).await.unwrap();
+
+    let encoding = res.parameters.get("application_name").unwrap();
+    assert_eq!(encoding, "test");
 
     let encoding = res.parameters.get("client_encoding").unwrap();
-    assert_eq!(encoding, "UTF8");
+    assert_eq!(encoding, "LATIN1");
 }
 
 #[tokio::test]
@@ -128,8 +141,8 @@ async fn test_pg_startup_md5() {
     let pg = run_pg().await;
     let (_, res) = connect("md5_user", "md5", pg.settings().port).await;
 
-    let encoding = res.parameters.get("client_encoding").unwrap();
-    assert_eq!(encoding, "UTF8");
+    let encoding = res.parameters.get("application_name").unwrap();
+    assert_eq!(encoding, "pg_stream");
 }
 
 #[tokio::test]
@@ -137,8 +150,8 @@ async fn test_pg_startup_sha() {
     let pg = run_pg().await;
     let (_, res) = connect("sha_user", "sha", pg.settings().port).await;
 
-    let encoding = res.parameters.get("client_encoding").unwrap();
-    assert_eq!(encoding, "UTF8");
+    let encoding = res.parameters.get("application_name").unwrap();
+    assert_eq!(encoding, "pg_stream");
 }
 
 async fn pem_to_der(pem_path: &str) -> std::io::Result<Vec<u8>> {
