@@ -163,6 +163,7 @@ pub async fn read_frame(mut stream: impl AsyncRead + Unpin) -> std::io::Result<P
     Ok(PgFrame::new(code, body))
 }
 
+#[inline]
 unsafe fn init_body(len: usize) -> std::io::Result<BytesMut> {
     let mut body = BytesMut::with_capacity(len);
     unsafe {
