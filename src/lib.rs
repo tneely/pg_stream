@@ -16,10 +16,10 @@
 //! # Example: Simple Query
 //!
 //! ```no_run
-//! use pg_stream::{ConnectionBuilder, AuthenticationMode};
+//! use pg_stream::startup::{ConnectionBuilder, AuthenticationMode};
 //!
 //! # #[tokio::main]
-//! # async fn main() -> pg_stream::ConnectResult<()> {
+//! # async fn main() -> pg_stream::startup::Result<()> {
 //! let stream = tokio::net::TcpStream::connect("localhost:5432").await?;
 //!
 //! let (mut conn, startup) = ConnectionBuilder::new("postgres")
@@ -46,7 +46,7 @@
 //! # Example: Prepared Statements
 //!
 //! ```no_run
-//! # use pg_stream::{ConnectionBuilder, PgStream};
+//! # use pg_stream::{startup::ConnectionBuilder, PgStream};
 //! # use pg_stream::messages::frontend::{ParameterKind, BindParameter, ResultFormat};
 //! # async fn example(mut conn: PgStream<tokio::net::TcpStream>) -> std::io::Result<()> {
 //! // Parse a prepared statement
@@ -136,13 +136,14 @@
 //!
 //! Currently, this crate has no optional features.
 
-mod connect;
+#[cfg(feature = "startup")]
+pub mod startup;
+
 mod error;
 pub mod messages;
 mod pg_stream;
 mod pg_stream_proto;
 
-pub use connect::*;
 pub use error::*;
 pub use pg_stream::*;
 pub use pg_stream_proto::*;
