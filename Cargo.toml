@@ -16,10 +16,15 @@ scram = { version = "0.6", optional = true } # TODO: Find a better library or ro
 [dev-dependencies]
 aws-lc-rs = "1"
 base64 = "0"
+criterion = "0"
 ctor = "0"
 postgresql_commands = "0"
 postgresql_embedded = { version = "0", features = ["tokio", "rustls"] }
 tempfile = "3"
 rustls = { version = "0", features = ["aws-lc-rs"] }
-tokio = { version = "1", features = ["full"] }
+tokio = "1"
 tokio-rustls ={ version = "0", features = ["aws-lc-rs"] }
+
+[[bench]]
+name = "pgstream_bench"
+harness = false

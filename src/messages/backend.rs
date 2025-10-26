@@ -146,15 +146,8 @@ pub async fn read_frame(mut stream: impl AsyncRead + Unpin) -> std::io::Result<P
 
     let mut buf = [0; 4];
     stream.read_exact(&mut buf).await?;
-    let len = u32::from_be_bytes(buf) as usize - size_of::<u32>();
-    // SAFETY: The uninitialized bytes are never read
-    let mut body = unsafe { init_body(len)? };
-    stream.read_exact(&mut body).await?;
+    let len = u32::from_be_bytes(buf) as usize;
 
-    Ok(PgFrame::new(code, body))
-}
-
-unsafe fn init_body(len: usize) -> std::io::Result<BytesMut> {
     if len > MAX_FRAME_SIZE_BYTES {
         let err_msg = format!("frame size exceeds {MAX_FRAME_SIZE_BYTES}B");
         return Err(std::io::Error::new(
@@ -162,6 +155,15 @@ unsafe fn init_body(len: usize) -> std::io::Result<BytesMut> {
             err_msg,
         ));
     }
+
+    // SAFETY: The uninitialized bytes are never read
+    let mut body = unsafe { init_body(len - size_of::<u32>())? };
+    stream.read_exact(&mut body).await?;
+
+    Ok(PgFrame::new(code, body))
+}
+
+unsafe fn init_body(len: usize) -> std::io::Result<BytesMut> {
     let mut body = BytesMut::with_capacity(len);
     unsafe {
         body.set_len(len);
@@ -185,5 +187,33 @@ pub(crate) fn read_cstring(bytes: &mut Bytes) -> std::io::Result<String> {
     match String::from_utf8(bytes[..end].to_vec()) {
         Ok(string) => Ok(string),
         Err(err) => Err(std::io::Error::other(err)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::ErrorKind;
+
+    use bytes::{BufMut, BytesMut};
+
+    use crate::messages::backend::{MAX_FRAME_SIZE_BYTES, read_frame};
+
+    #[tokio::test]
+    async fn can_read_max_size_frame() {
+        let mut buf = BytesMut::new();
+        buf.put_u8(42);
+        buf.put_u32(MAX_FRAME_SIZE_BYTES as u32);
+        let err = read_frame(buf.as_ref()).await.err().unwrap();
+        // We only wrote 5 bytes but are trying to read 1 GiB so we'd expect an EoF
+        assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
+    }
+
+    #[tokio::test]
+    async fn can_not_read_past_max_size_frame() {
+        let mut buf = BytesMut::new();
+        buf.put_u8(42);
+        buf.put_u32(MAX_FRAME_SIZE_BYTES as u32 + 1);
+        let err = read_frame(buf.as_ref()).await.err().unwrap();
+        assert_eq!(err.kind(), ErrorKind::QuotaExceeded);
     }
 }
