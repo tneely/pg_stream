@@ -1,8 +1,11 @@
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
 use pg_stream::messages::frontend;
-use pg_stream::{AuthenticationMode, ConnectionBuilder, messages::backend};
-use pg_stream::{PgStream, StartupResponse};
+use pg_stream::{
+    PgErrorResponse, PgStream,
+    startup::{AuthenticationMode, ConnectionBuilder, StartupResponse},
+    messages::backend,
+};
 use postgresql_embedded::{PostgreSQL, Settings, Status};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -315,4 +318,44 @@ async fn test_put_fn_call_sqrt() {
     // 2. Expect ReadyForQuery
     let frame = pg_stream.read_frame().await.unwrap();
     assert_eq!(frame.code, backend::MessageCode::READY_FOR_QUERY);
+}
+
+#[tokio::test]
+async fn test_parse_error_response() {
+    let pg = run_pg().await;
+    let (mut pg_stream, _) = connect_pg(&pg).await;
+
+    pg_stream.put_query("SELECT * FROM fake_table");
+    pg_stream.flush().await.unwrap();
+
+    let frame = pg_stream.read_frame().await.unwrap();
+    let err: PgErrorResponse = frame.try_into().unwrap();
+
+    assert_eq!(Some("ERROR".into()), err.local_severity());
+    assert_eq!(Some("ERROR".into()), err.severity());
+    assert_eq!(Some("42P01".into()), err.code());
+    assert_eq!(
+        Some("relation \"fake_table\" does not exist".into()),
+        err.message()
+    );
+    assert_eq!(None, err.detail());
+    assert_eq!(None, err.hint());
+    assert_eq!(Some("15".into()), err.position());
+    assert_eq!(None, err.r#where());
+    assert_eq!(Some("parse_relation.c".into()), err.file());
+    assert_eq!(Some("1452".into()), err.line());
+    assert_eq!(Some("parserOpenTable".into()), err.routine());
+
+    assert_eq!(
+        "[ERROR] 42P01: relation \"fake_table\" does not exist",
+        err.to_string()
+    );
+    assert_eq!(
+        "PgErrorResponse { local_severity: Some(\"ERROR\"), severity: Some(\"ERROR\"), \
+        code: Some(\"42P01\"), message: Some(\"relation \\\"fake_table\\\" does not exist\"), \
+        detail: None, hint: None, position: Some(\"15\"), where: None, \
+        file: Some(\"parse_relation.c\"), line: Some(\"1452\"), \
+        routine: Some(\"parserOpenTable\"), .. }",
+        format!("{err:?}")
+    );
 }
