@@ -11,14 +11,3 @@ updates:
       interval: "weekly"
     commit-message:
       prefix: "chore"
-    # optional: ignore pre-releases
-    ignore:
-      - dependency-name: "*"
-        versions: ["*alpha*", "*beta*"]
-    # group updates
-    groups:
-      all-rust-deps:
-        patterns:
-          - "*"
-        # optional: limit how often grouped PRs are created
-        # update-type: "all"   # default is "version-update:semver-major"
