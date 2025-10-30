@@ -1,0 +1,24 @@
+# To get started with Dependabot version updates, you'll need to specify which
+# package ecosystems to update and where the package manifests are located.
+# Please see the documentation for all configuration options:
+# https://docs.github.com/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"   # path to your Cargo.toml
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "chore"
+    # optional: ignore pre-releases
+    ignore:
+      - dependency-name: "*"
+        versions: ["*alpha*", "*beta*"]
+    # group updates
+    groups:
+      all-rust-deps:
+        patterns:
+          - "*"
+        # optional: limit how often grouped PRs are created
+        # update-type: "all"   # default is "version-update:semver-major"
