@@ -8,6 +8,10 @@ updates:
   - package-ecosystem: "cargo"
     directory: "/"   # path to your Cargo.toml
     schedule:
-      interval: "weekly"
+      interval: "monthly"
     commit-message:
       prefix: "chore"
+    groups:
+      all-deps:
+        patterns:
+          - "*"
