@@ -2,7 +2,7 @@ use std::{borrow::Cow, ops::Range};
 
 use bytes::Bytes;
 
-use crate::messages::backend::{self, PgFrame};
+use crate::message::backend::{self, PgFrame};
 
 /// A zero-copy representation of a Postgres ErrorResponse or NoticeResponse
 pub struct PgErrorResponse {

@@ -1,15 +1,11 @@
 use std::hint::black_box;
 
+use bytes::BytesMut;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 
 use pg_stream::{
-    PgStream,
-    messages::{
-        backend,
-        frontend::{
-            BindParameter, FormatCode, FunctionArg, ParameterKind, ResultFormat, TargetKind,
-        },
-    },
+    FrontendMessage,
+    message::{Bindable, FormatCode, backend, oid},
 };
 
 fn bench_put_query(c: &mut Criterion) {
@@ -30,9 +26,8 @@ fn bench_put_query(c: &mut Criterion) {
     for (name, query) in queries {
         group.bench_with_input(BenchmarkId::from_parameter(name), &query, |b, &query| {
             b.iter(|| {
-                let stream = Vec::<u8>::new();
-                let mut pg_stream = PgStream::from_stream(stream);
-                pg_stream.put_query(black_box(query));
+                let mut buf = BytesMut::with_capacity(256);
+                buf.query(black_box(query));
             });
         });
     }
@@ -43,60 +38,52 @@ fn bench_put_query(c: &mut Criterion) {
 fn bench_put_parse(c: &mut Criterion) {
     let mut group = c.benchmark_group("put_parse");
 
-    let param_types_small = vec![];
-    let param_types_medium = vec![
-        ParameterKind::Int4,
-        ParameterKind::Text,
-        ParameterKind::Timestamp,
-    ];
-    let param_types_large = vec![
-        ParameterKind::Int4,
-        ParameterKind::Int8,
-        ParameterKind::Text,
-        ParameterKind::Varchar,
-        ParameterKind::Timestamp,
-        ParameterKind::Bool,
-        ParameterKind::Float4,
-        ParameterKind::Float8,
-        ParameterKind::Numeric,
-        ParameterKind::Bytea,
+    let param_types_small: &[u32] = &[];
+    let param_types_medium: &[u32] = &[oid::INT4, oid::TEXT, oid::TIMESTAMP];
+    let param_types_large: &[u32] = &[
+        oid::INT4,
+        oid::INT8,
+        oid::TEXT,
+        oid::VARCHAR,
+        oid::TIMESTAMP,
+        oid::BOOL,
+        oid::FLOAT4,
+        oid::FLOAT8,
+        oid::NUMERIC,
+        oid::BYTEA,
     ];
 
     group.bench_function("no_params", |b| {
         b.iter(|| {
-            let stream = Vec::<u8>::new();
-            let mut pg_stream = PgStream::from_stream(stream);
-            pg_stream.put_parse(
-                black_box("stmt1"),
-                black_box("SELECT * FROM users WHERE id = $1"),
-                black_box(&param_types_small),
-            );
+            let mut buf = BytesMut::with_capacity(256);
+            buf.parse(Some(black_box("stmt1")))
+                .query(black_box("SELECT * FROM users WHERE id = $1"))
+                .param_types(black_box(param_types_small))
+                .finish();
         });
     });
 
     group.bench_function("three_params", |b| {
         b.iter(|| {
-            let stream = Vec::<u8>::new();
-            let mut pg_stream = PgStream::from_stream(stream);
-            pg_stream.put_parse(
-                black_box("stmt2"),
-                black_box("SELECT * FROM users WHERE id = $1 AND name = $2 AND created_at > $3"),
-                black_box(&param_types_medium),
-            );
+            let mut buf = BytesMut::with_capacity(256);
+            buf.parse(Some(black_box("stmt2")))
+                .query(black_box(
+                    "SELECT * FROM users WHERE id = $1 AND name = $2 AND created_at > $3",
+                ))
+                .param_types(black_box(param_types_medium))
+                .finish();
         });
     });
 
     group.bench_function("ten_params", |b| {
         b.iter(|| {
-            let stream = Vec::<u8>::new();
-            let mut pg_stream = PgStream::from_stream(stream);
-            pg_stream.put_parse(
-                black_box("stmt3"),
-                black_box(
+            let mut buf = BytesMut::with_capacity(256);
+            buf.parse(Some(black_box("stmt3")))
+                .query(black_box(
                     "INSERT INTO large_table VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
-                ),
-                black_box(&param_types_large),
-            );
+                ))
+                .param_types(black_box(param_types_large))
+                .finish();
         });
     });
 
@@ -106,68 +93,49 @@ fn bench_put_parse(c: &mut Criterion) {
 fn bench_put_bind(c: &mut Criterion) {
     let mut group = c.benchmark_group("put_bind");
 
-    // Create different parameter sets
-    let params_small = vec![BindParameter::Text("42".to_string())];
-
-    let params_medium = vec![
-        BindParameter::Text("42".to_string()),
-        BindParameter::Text("John Doe".to_string()),
-        BindParameter::RawBinary(vec![1, 2, 3, 4].into()),
-    ];
-
-    let params_large = vec![
-        BindParameter::Text("1".to_string()),
-        BindParameter::Text("2".to_string()),
-        BindParameter::RawBinary(vec![1, 2, 3, 4, 5, 6, 7, 8].into()),
-        BindParameter::Text("test".to_string()),
-        BindParameter::RawBinary(vec![9, 10, 11, 12].into()),
-        BindParameter::Text("more data".to_string()),
-        BindParameter::Null,
-        BindParameter::Text("final".to_string()),
-    ];
-
     group.bench_function("one_param_text_result", |b| {
         b.iter(|| {
-            let stream = Vec::<u8>::new();
-            let mut pg_stream = PgStream::from_stream(stream);
-            pg_stream.put_bind(
-                black_box(""),
-                black_box("stmt1"),
-                black_box(&params_small),
-                black_box(ResultFormat::Text),
-            );
+            let mut buf = BytesMut::with_capacity(256);
+            buf.bind(None)
+                .statement(black_box(""))
+                .result_format(FormatCode::Text)
+                .finish(&[&"42" as &dyn Bindable]);
         });
     });
 
-    group.bench_function("three_params_RawBinary_result", |b| {
+    group.bench_function("three_params_binary_result", |b| {
+        let binary_data: &[u8] = &[1, 2, 3, 4];
         b.iter(|| {
-            let stream = Vec::<u8>::new();
-            let mut pg_stream = PgStream::from_stream(stream);
-            pg_stream.put_bind(
-                black_box("portal1"),
-                black_box("stmt2"),
-                black_box(&params_medium),
-                black_box(ResultFormat::Binary),
-            );
+            let mut buf = BytesMut::with_capacity(256);
+            buf.bind(Some(black_box("portal1")))
+                .statement(black_box("stmt1"))
+                .result_format(FormatCode::Binary)
+                .finish(&[
+                    &"42" as &dyn Bindable,
+                    &"John Doe" as &dyn Bindable,
+                    &binary_data as &dyn Bindable,
+                ]);
         });
     });
 
-    group.bench_function("eight_params_mixed_result", |b| {
-        let mixed_formats = vec![
-            FormatCode::Text,
-            FormatCode::Binary,
-            FormatCode::Text,
-            FormatCode::Binary,
-        ];
+    group.bench_function("eight_params_mixed", |b| {
+        let binary1: &[u8] = &[1, 2, 3, 4, 5, 6, 7, 8];
+        let binary2: &[u8] = &[9, 10, 11, 12];
+        let none: Option<i32> = None;
         b.iter(|| {
-            let stream = Vec::<u8>::new();
-            let mut pg_stream = PgStream::from_stream(stream);
-            pg_stream.put_bind(
-                black_box("portal2"),
-                black_box("stmt3"),
-                black_box(&params_large),
-                black_box(ResultFormat::Mixed(&mixed_formats)),
-            );
+            let mut buf = BytesMut::with_capacity(256);
+            buf.bind(Some(black_box("portal2")))
+                .statement(black_box("stmt2"))
+                .finish(&[
+                    &"1" as &dyn Bindable,
+                    &"2" as &dyn Bindable,
+                    &binary1 as &dyn Bindable,
+                    &"test" as &dyn Bindable,
+                    &binary2 as &dyn Bindable,
+                    &"more data" as &dyn Bindable,
+                    &none as &dyn Bindable,
+                    &"final" as &dyn Bindable,
+                ]);
         });
     });
 
@@ -179,17 +147,15 @@ fn bench_put_describe(c: &mut Criterion) {
 
     group.bench_function("portal", |b| {
         b.iter(|| {
-            let stream = Vec::<u8>::new();
-            let mut pg_stream = PgStream::from_stream(stream);
-            pg_stream.put_describe(black_box(TargetKind::new_portal("my_portal")));
+            let mut buf = BytesMut::with_capacity(64);
+            buf.describe_portal(Some(black_box("my_portal")));
         });
     });
 
     group.bench_function("statement", |b| {
         b.iter(|| {
-            let stream = Vec::<u8>::new();
-            let mut pg_stream = PgStream::from_stream(stream);
-            pg_stream.put_describe(black_box(TargetKind::new_stmt("my_stmt")));
+            let mut buf = BytesMut::with_capacity(64);
+            buf.describe_statement(Some(black_box("my_stmt")));
         });
     });
 
@@ -201,17 +167,15 @@ fn bench_put_execute(c: &mut Criterion) {
 
     group.bench_function("unlimited_rows", |b| {
         b.iter(|| {
-            let stream = Vec::<u8>::new();
-            let mut pg_stream = PgStream::from_stream(stream);
-            pg_stream.put_execute(black_box("portal1"), black_box(None));
+            let mut buf = BytesMut::with_capacity(64);
+            buf.execute(Some(black_box("portal1")), black_box(0));
         });
     });
 
     group.bench_function("limited_rows", |b| {
         b.iter(|| {
-            let stream = Vec::<u8>::new();
-            let mut pg_stream = PgStream::from_stream(stream);
-            pg_stream.put_execute(black_box("portal2"), black_box(Some(100)));
+            let mut buf = BytesMut::with_capacity(64);
+            buf.execute(Some(black_box("portal2")), black_box(100));
         });
     });
 
@@ -221,34 +185,26 @@ fn bench_put_execute(c: &mut Criterion) {
 fn bench_put_fn_call(c: &mut Criterion) {
     let mut group = c.benchmark_group("put_fn_call");
 
-    let args_small = vec![FunctionArg::Text("arg1".to_string())];
-    let args_medium = vec![
-        FunctionArg::Text("arg1".to_string()),
-        FunctionArg::RawBinary(vec![1, 2, 3, 4].into()),
-        FunctionArg::Text("arg3".to_string()),
-    ];
-
     group.bench_function("one_arg_text_result", |b| {
         b.iter(|| {
-            let stream = Vec::<u8>::new();
-            let mut pg_stream = PgStream::from_stream(stream);
-            pg_stream.put_fn_call(
-                black_box(12345),
-                black_box(&args_small),
-                black_box(FormatCode::Text),
-            );
+            let mut buf = BytesMut::with_capacity(64);
+            buf.fn_call(black_box(12345))
+                .result_format(FormatCode::Text)
+                .finish(&[&"arg1" as &dyn Bindable]);
         });
     });
 
     group.bench_function("three_args_binary_result", |b| {
+        let binary_data: &[u8] = &[1, 2, 3, 4];
         b.iter(|| {
-            let stream = Vec::<u8>::new();
-            let mut pg_stream = PgStream::from_stream(stream);
-            pg_stream.put_fn_call(
-                black_box(67890),
-                black_box(&args_medium),
-                black_box(FormatCode::Binary),
-            );
+            let mut buf = BytesMut::with_capacity(64);
+            buf.fn_call(black_box(67890))
+                .result_format(FormatCode::Binary)
+                .finish(&[
+                    &"arg1" as &dyn Bindable,
+                    &binary_data as &dyn Bindable,
+                    &"arg3" as &dyn Bindable,
+                ]);
         });
     });
 
@@ -259,48 +215,37 @@ fn bench_chained_operations(c: &mut Criterion) {
     let mut group = c.benchmark_group("chained_operations");
 
     group.bench_function("parse_bind_execute_sync", |b| {
-        let params = vec![BindParameter::Text("42".to_string())];
         b.iter(|| {
-            let stream = Vec::<u8>::new();
-            let mut pg_stream = PgStream::from_stream(stream);
-            pg_stream
-                .put_parse(black_box("stmt"), black_box("SELECT $1"), black_box(&[]))
-                .put_bind(
-                    black_box(""),
-                    black_box("stmt"),
-                    black_box(&params),
-                    black_box(ResultFormat::Text),
-                )
-                .put_execute(black_box(""), black_box(None))
-                .put_sync();
+            let mut buf = BytesMut::with_capacity(256);
+            buf.parse(Some(black_box("stmt")))
+                .query(black_box("SELECT $1"))
+                .finish()
+                .bind(Some(black_box("stmt")))
+                .finish(&[&"42" as &dyn Bindable])
+                .execute(None, black_box(0))
+                .sync();
         });
     });
 
     group.bench_function("complex_extended_query", |b| {
-        let params = vec![
-            BindParameter::Text("value1".to_string()),
-            BindParameter::RawBinary(vec![1, 2, 3, 4].into()),
-        ];
+        let binary_data: &[u8] = &[1, 2, 3, 4];
         b.iter(|| {
-            let stream = Vec::<u8>::new();
-            let mut pg_stream = PgStream::from_stream(stream);
-            pg_stream
-                .put_parse(
-                    black_box("complex_stmt"),
-                    black_box("SELECT * FROM table WHERE col1 = $1 AND col2 = $2"),
-                    black_box(&[ParameterKind::Text, ParameterKind::Bytea]),
-                )
-                .put_describe(black_box(TargetKind::new_stmt("complex_stmt")))
-                .put_bind(
-                    black_box("my_portal"),
-                    black_box("complex_stmt"),
-                    black_box(&params),
-                    black_box(ResultFormat::Binary),
-                )
-                .put_describe(black_box(TargetKind::new_portal("my_portal")))
-                .put_execute(black_box("my_portal"), black_box(Some(50)))
-                .put_close(black_box(TargetKind::new_portal("my_portal")))
-                .put_sync();
+            let mut buf = BytesMut::with_capacity(512);
+            buf.parse(Some(black_box("complex_stmt")))
+                .query(black_box(
+                    "SELECT * FROM table WHERE col1 = $1 AND col2 = $2",
+                ))
+                .param_types(&[oid::TEXT, oid::BYTEA])
+                .finish()
+                .describe_statement(Some(black_box("complex_stmt")))
+                .bind(Some(black_box("my_portal")))
+                .statement(black_box("complex_stmt"))
+                .result_format(FormatCode::Binary)
+                .finish(&[&"value1" as &dyn Bindable, &binary_data as &dyn Bindable])
+                .describe_portal(Some(black_box("my_portal")))
+                .execute(Some(black_box("my_portal")), black_box(50))
+                .close_portal(Some(black_box("my_portal")))
+                .sync();
         });
     });
 

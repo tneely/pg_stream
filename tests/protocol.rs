@@ -1,9 +1,8 @@
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
-use pg_stream::messages::frontend;
 use pg_stream::{
-    PgErrorResponse, PgStream,
-    messages::backend,
+    FrontendMessage, PgConnection, PgErrorResponse,
+    message::{Bindable, FormatCode, backend, oid},
     startup::{AuthenticationMode, ConnectionBuilder, StartupResponse},
 };
 use postgresql_embedded::{PostgreSQL, Settings, Status};
@@ -34,20 +33,18 @@ async fn run_pg() -> &'static PostgreSQL {
             tokio::fs::copy("tests/data/certs/server.key", "data/db/server.key").await?;
             pg.start().await?;
 
-            let (mut stream, _) = connect_pg(&pg).await;
-            stream
-                .put_query(
-                    "
-                    CREATE ROLE pw_user WITH LOGIN PASSWORD 'pw';
-                    CREATE ROLE md5_user WITH LOGIN PASSWORD 'md5';
-                    CREATE ROLE sha_user WITH LOGIN PASSWORD 'sha';
-                    ",
-                )
-                .flush()
-                .await?;
+            let (mut conn, _) = connect_pg(&pg).await;
+            conn.buf().query(
+                "
+                CREATE ROLE pw_user WITH LOGIN PASSWORD 'pw';
+                CREATE ROLE md5_user WITH LOGIN PASSWORD 'md5';
+                CREATE ROLE sha_user WITH LOGIN PASSWORD 'sha';
+                ",
+            );
+            conn.flush().await?;
 
             loop {
-                let frame = stream.read_frame().await?;
+                let frame = conn.recv().await?;
                 if frame.code == backend::MessageCode::READY_FOR_QUERY {
                     break;
                 }
@@ -89,7 +86,7 @@ fn drop_pg() {
     }
 }
 
-async fn connect_pg(pg: &PostgreSQL) -> (PgStream<TcpStream>, StartupResponse) {
+async fn connect_pg(pg: &PostgreSQL) -> (PgConnection<TcpStream>, StartupResponse) {
     let Settings {
         username,
         password,
@@ -103,7 +100,7 @@ async fn connect(
     username: &str,
     password: &str,
     port: u16,
-) -> (PgStream<TcpStream>, StartupResponse) {
+) -> (PgConnection<TcpStream>, StartupResponse) {
     let cb = ConnectionBuilder::new(username)
         .database("postgres")
         .auth(AuthenticationMode::Password(password.to_string()));
@@ -206,40 +203,45 @@ async fn test_pg_startup_tls() {
 #[tokio::test]
 async fn test_pg_extended_protocol() {
     let pg = run_pg().await;
-    let (mut pg_stream, _) = connect_pg(&pg).await;
+    let (mut conn, _) = connect_pg(&pg).await;
 
     //
     // 1. Parse a named statement
     //
-    pg_stream.put_parse("stmt1", "SELECT $1 + 1", &[frontend::ParameterKind::Int4]);
-    pg_stream.put_flush();
-    pg_stream.flush().await.unwrap();
+    conn.buf()
+        .parse(Some("stmt1"))
+        .query("SELECT $1 + 1")
+        .param_types(&[oid::INT4])
+        .finish()
+        .flush_msg();
+    conn.flush().await.unwrap();
 
     // Expect ParseComplete
-    let frame = pg_stream.read_frame().await.unwrap();
+    let frame = conn.recv().await.unwrap();
     assert_eq!(frame.code, backend::MessageCode::PARSE_COMPLETE);
 
     //
     // 2. Bind to create a named portal
     //
-    let params = [frontend::BindParameter::Int4(2)];
-    pg_stream.put_bind("portal1", "stmt1", &params, frontend::ResultFormat::Text);
-    pg_stream.put_flush();
-    pg_stream.flush().await.unwrap();
+    conn.buf()
+        .bind(Some("portal1"))
+        .statement("stmt1")
+        .finish(&[&2i32 as &dyn Bindable])
+        .flush_msg();
+    conn.flush().await.unwrap();
 
     // Expect BindComplete
-    let frame = pg_stream.read_frame().await.unwrap();
+    let frame = conn.recv().await.unwrap();
     assert_eq!(frame.code, backend::MessageCode::BIND_COMPLETE);
 
     //
     // 3. Describe the portal
     //
-    pg_stream.put_describe(frontend::TargetKind::new_portal("portal1"));
-    pg_stream.put_flush();
-    pg_stream.flush().await.unwrap();
+    conn.buf().describe_portal(Some("portal1")).flush_msg();
+    conn.flush().await.unwrap();
 
     // Expect RowDescription
-    let frame = pg_stream.read_frame().await.unwrap();
+    let frame = conn.recv().await.unwrap();
     assert_eq!(frame.code, backend::MessageCode::ROW_DESCRIPTION);
     // For "SELECT $1::int + 1", we expect one column: "?column?"
     let col = b"?column?";
@@ -248,42 +250,42 @@ async fn test_pg_extended_protocol() {
     //
     // 4. Execute the portal
     //
-    pg_stream.put_execute("portal1", 0);
-    pg_stream.put_flush();
-    pg_stream.flush().await.unwrap();
+    conn.buf().execute(Some("portal1"), 0).flush_msg();
+    conn.flush().await.unwrap();
 
     // Expect DataRow + CommandComplete
-    let frame = pg_stream.read_frame().await.unwrap();
+    let frame = conn.recv().await.unwrap();
     assert_eq!(frame.code, backend::MessageCode::DATA_ROW);
     // The value should be "3" since 2 + 1 = 3
     assert_eq!(&frame.body[6..], b"3");
 
-    let frame = pg_stream.read_frame().await.unwrap();
+    let frame = conn.recv().await.unwrap();
     assert_eq!(frame.code, backend::MessageCode::COMMAND_COMPLETE);
     assert_eq!(frame.body, b"SELECT 1\0".as_ref());
 
     //
     // 5. Close both portal and statement
     //
-    pg_stream.put_close(frontend::TargetKind::new_portal("portal1"));
-    pg_stream.put_close(frontend::TargetKind::new_stmt("stmt1"));
-    pg_stream.put_flush();
-    pg_stream.flush().await.unwrap();
+    conn.buf()
+        .close_portal(Some("portal1"))
+        .close_statement(Some("stmt1"))
+        .flush_msg();
+    conn.flush().await.unwrap();
 
     // Expect two CloseComplete
-    let frame = pg_stream.read_frame().await.unwrap();
+    let frame = conn.recv().await.unwrap();
     assert_eq!(frame.code, backend::MessageCode::CLOSE_COMPLETE);
 
-    let frame = pg_stream.read_frame().await.unwrap();
+    let frame = conn.recv().await.unwrap();
     assert_eq!(frame.code, backend::MessageCode::CLOSE_COMPLETE);
 
     //
     // 6. Sync (end of extended protocol)
     //
-    pg_stream.put_sync();
-    pg_stream.flush().await.unwrap();
+    conn.buf().sync();
+    conn.flush().await.unwrap();
 
-    let frame = pg_stream.read_frame().await.unwrap();
+    let frame = conn.recv().await.unwrap();
     assert_eq!(frame.code, backend::MessageCode::READY_FOR_QUERY);
     assert_eq!(frame.body, b"I".as_ref());
 }
@@ -291,57 +293,59 @@ async fn test_pg_extended_protocol() {
 #[tokio::test]
 async fn test_put_query_select_1() {
     let pg = run_pg().await;
-    let (mut pg_stream, _) = connect_pg(&pg).await;
+    let (mut conn, _) = connect_pg(&pg).await;
 
-    pg_stream.put_query("SELECT 1");
-    pg_stream.put_flush();
-    pg_stream.flush().await.unwrap();
+    conn.buf().query("SELECT 1").flush_msg();
+    conn.flush().await.unwrap();
 
-    let frame = pg_stream.read_frame().await.unwrap();
+    let frame = conn.recv().await.unwrap();
     assert_eq!(frame.code, backend::MessageCode::ROW_DESCRIPTION);
     assert!(!frame.body.is_empty());
 
-    let frame = pg_stream.read_frame().await.unwrap();
+    let frame = conn.recv().await.unwrap();
     assert_eq!(frame.code, backend::MessageCode::DATA_ROW);
     assert_eq!(&frame.body[6..], b"1".as_ref());
 
-    let frame = pg_stream.read_frame().await.unwrap();
+    let frame = conn.recv().await.unwrap();
     assert_eq!(frame.code, backend::MessageCode::COMMAND_COMPLETE);
     assert_eq!(frame.body, b"SELECT 1\0".as_ref());
 
-    let frame = pg_stream.read_frame().await.unwrap();
+    let frame = conn.recv().await.unwrap();
     assert_eq!(frame.code, backend::MessageCode::READY_FOR_QUERY);
 }
 
 #[tokio::test]
 async fn test_put_fn_call_sqrt() {
     let pg = run_pg().await;
-    let (mut pg_stream, _) = connect_pg(&pg).await;
+    let (mut conn, _) = connect_pg(&pg).await;
 
     // Call built-in function 1344 = sqrt(float8)
     // This may change depending on the version (SELECT oid FROM pg_proc WHERE proname = 'sqrt';)
-    pg_stream.put_fn_call(1344, &["9".into()], frontend::FormatCode::Text);
-    pg_stream.flush().await.unwrap();
+    conn.buf()
+        .fn_call(1344)
+        .result_format(FormatCode::Text)
+        .finish(&[&"9" as &dyn Bindable]);
+    conn.flush().await.unwrap();
 
     // 1. Expect FunctionCallResponse
-    let frame = pg_stream.read_frame().await.unwrap();
+    let frame = conn.recv().await.unwrap();
     assert_eq!(frame.code, backend::MessageCode::FUNCTION_CALL_RESPONSE);
     assert_eq!(&frame.body[4..], b"3".as_ref());
 
     // 2. Expect ReadyForQuery
-    let frame = pg_stream.read_frame().await.unwrap();
+    let frame = conn.recv().await.unwrap();
     assert_eq!(frame.code, backend::MessageCode::READY_FOR_QUERY);
 }
 
 #[tokio::test]
 async fn test_parse_error_response() {
     let pg = run_pg().await;
-    let (mut pg_stream, _) = connect_pg(&pg).await;
+    let (mut conn, _) = connect_pg(&pg).await;
 
-    pg_stream.put_query("SELECT * FROM fake_table");
-    pg_stream.flush().await.unwrap();
+    conn.buf().query("SELECT * FROM fake_table");
+    conn.flush().await.unwrap();
 
-    let frame = pg_stream.read_frame().await.unwrap();
+    let frame = conn.recv().await.unwrap();
     let err: PgErrorResponse = frame.try_into().unwrap();
 
     assert_eq!(Some("ERROR".into()), err.local_severity());

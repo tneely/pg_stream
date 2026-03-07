@@ -1,4 +1,4 @@
-//! PgStream.
+//! PgStream - Low-level Postgres wire protocol library.
 //!
 //! This crate provides direct access to the Postgres frontend/backend protocol,
 //! allowing you to build custom database clients or tools without the overhead
@@ -10,13 +10,14 @@
 //!
 //! - **Connection establishment** via [`ConnectionBuilder`] with support for
 //!   authentication and TLS
-//! - **Message construction** using the fluent API on [`PgStream`]
-//! - **Frame reading** from backend responses
+//! - **Message construction** using the [`FrontendMessage`] extension trait on any buffer
+//! - **Frame reading** from backend responses via [`PgConnection`]
 //!
 //! # Example: Simple Query
 //!
 //! ```no_run
 //! use pg_stream::startup::{ConnectionBuilder, AuthenticationMode};
+//! use pg_stream::FrontendMessage;
 //!
 //! # #[tokio::main]
 //! # async fn main() -> pg_stream::startup::Result<()> {
@@ -29,13 +30,13 @@
 //!     .await?;
 //!
 //! // Execute a query
-//! conn.put_query("SELECT 1")
-//!     .flush()
-//!     .await?;
+//! conn.buf()
+//!     .query("SELECT 1");
+//! conn.flush().await?;
 //!
 //! // Read responses
 //! loop {
-//!     let frame = conn.read_frame().await?;
+//!     let frame = conn.recv().await?;
 //!     // Process frame...
 //!     # break;
 //! }
@@ -46,73 +47,50 @@
 //! # Example: Prepared Statements
 //!
 //! ```no_run
-//! # use pg_stream::{startup::ConnectionBuilder, PgStream};
-//! # use pg_stream::messages::frontend::{ParameterKind, BindParameter, ResultFormat};
-//! # async fn example(mut conn: PgStream<tokio::net::TcpStream>) -> std::io::Result<()> {
+//! # use pg_stream::{startup::ConnectionBuilder, PgConnection, FrontendMessage};
+//! # use pg_stream::message::{Bindable, oid};
+//! # async fn example(mut conn: PgConnection<tokio::net::TcpStream>) -> std::io::Result<()> {
 //! // Parse a prepared statement
-//! conn.put_parse("stmt", "SELECT $1::int", &[ParameterKind::Int4])
-//!     .flush()
-//!     .await?;
+//! conn.buf()
+//!     .parse(Some("stmt"))
+//!     .query("SELECT $1::int")
+//!     .param_types(&[oid::INT4])
+//!     .finish();
+//! conn.flush().await?;
 //!
 //! // Bind and execute
-//! conn.put_bind("", "stmt", &[BindParameter::Text("42".to_string())], ResultFormat::Text)
-//!     .put_execute("", None)
-//!     .put_sync()
-//!     .flush()
-//!     .await?;
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! # Example: Function Calls
-//!
-//! ```no_run
-//! # use pg_stream::PgStream;
-//! # use pg_stream::messages::frontend::{FunctionArg, FormatCode};
-//! # async fn example(mut conn: PgStream<tokio::net::TcpStream>) -> std::io::Result<()> {
-//! // Call sqrt(9) - note that OID 1344 may vary by Postgres version
-//! conn.put_fn_call(1344, &[FunctionArg::Text("9".to_string())], FormatCode::Text)
-//!     .flush()
-//!     .await?;
+//! conn.buf()
+//!     .bind(Some("stmt"))
+//!     .finish(&[&42i32 as &dyn Bindable])
+//!     .execute(None, 0)
+//!     .sync();
+//! conn.flush().await?;
 //! # Ok(())
 //! # }
 //! ```
 //!
 //! # Protocol Messages
 //!
-//! The crate provides methods for constructing all major frontend protocol messages:
+//! The [`FrontendMessage`] trait provides methods for constructing all major
+//! frontend protocol messages on any buffer implementing [`BufMut`](bytes::BufMut):
 //!
-//! - **Query execution**: [`PgStream::put_query`], [`PgStream::put_execute`]
-//! - **Prepared statements**: [`PgStream::put_parse`], [`PgStream::put_bind`]
-//! - **Metadata**: [`PgStream::put_describe`]
-//! - **Resource management**: [`PgStream::put_close`]
-//! - **Flow control**: [`PgStream::put_flush`], [`PgStream::put_sync`]
-//! - **Function calls**: [`PgStream::put_fn_call`]
+//! - **Query execution**: [`query`](FrontendMessage::query), [`execute`](FrontendMessage::execute)
+//! - **Prepared statements**: [`parse`](FrontendMessage::parse), [`bind`](FrontendMessage::bind)
+//! - **Metadata**: [`describe_statement`](FrontendMessage::describe_statement), [`describe_portal`](FrontendMessage::describe_portal)
+//! - **Resource management**: [`close_statement`](FrontendMessage::close_statement), [`close_portal`](FrontendMessage::close_portal)
+//! - **Flow control**: [`flush_msg`](FrontendMessage::flush_msg), [`sync`](FrontendMessage::sync)
 //!
 //! # Authentication
 //!
 //! Currently supported authentication modes:
 //!
-//! - [`AuthenticationMode::Trust`] - No authentication
-//! - [`AuthenticationMode::Password`] - Cleartext password
-//!
-//! Other authentication methods (SASL, SCRAM, MD5, Kerberos, etc.) are not
-//! yet implemented and will return an error or panic.
+//! - [`AuthenticationMode::Trust`](startup::AuthenticationMode::Trust) - No authentication
+//! - [`AuthenticationMode::Password`](startup::AuthenticationMode::Password) - Cleartext or SCRAM-SHA-256
 //!
 //! # TLS Support
 //!
-//! TLS can be negotiated using [`ConnectionBuilder::connect_with_tls`] with
-//! a custom async upgrade function. The builder handles SSL request negotiation
-//! with the server.
-//!
-//! # Format Codes
-//!
-//! The protocol supports text and binary formats for parameters and results.
-//! The crate automatically optimizes format code encoding:
-//!
-//! - If all parameters use text format (the default), no format codes are sent
-//! - If all parameters use the same format, a single format code is sent
-//! - Otherwise, individual format codes are sent for each parameter
+//! TLS can be negotiated using [`ConnectionBuilder::connect_with_tls`](startup::ConnectionBuilder::connect_with_tls)
+//! with a custom async upgrade function.
 //!
 //! # Performance Considerations
 //!
@@ -130,19 +108,16 @@
 //! - **No SQL injection protection** - sanitize your inputs
 //! - **Manual resource management** - close your statements and portals
 //! - **No connection pooling** - manage connections yourself
-//!
-//! # Feature Flags
-//!
-//! Currently, this crate has no optional features.
 
+#[cfg(feature = "startup")]
+pub mod auth;
 #[cfg(feature = "startup")]
 pub mod startup;
 
+pub mod connection;
 mod error;
-pub mod messages;
-mod pg_stream;
-mod pg_stream_proto;
+pub mod message;
 
+pub use connection::PgConnection;
 pub use error::*;
-pub use pg_stream::*;
-pub use pg_stream_proto::*;
+pub use message::FrontendMessage;

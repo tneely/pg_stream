@@ -12,41 +12,42 @@ A low-level, zero-overhead Rust implementation of the Postgres wire protocol.
 - **TLS support** - Built-in SSL/TLS negotiation with custom upgrade functions
 - **Extended query protocol** - Full support for prepared statements, portals, and parameter binding
 - **Function calls** - Direct invocation of Postgres functions via protocol messages
-- **Type-safe message construction** - Fluent API for building protocol messages
+- **Extension trait API** - Write messages to any buffer implementing `BufMut`
 - **Format optimization** - Automatic optimization of format codes in bind and function call messages
 
 ## Quick Start
 
 ```rust
-use pg_proto::startup::{ConnectionBuilder, AuthenticationMode};
+use pg_stream::startup::{ConnectionBuilder, AuthenticationMode};
+use pg_stream::FrontendMessage;
+use pg_stream::messages::backend;
 
 #[tokio::main]
 async fn main() -> pg_stream::startup::Result<()> {
     let stream = tokio::net::TcpStream::connect("localhost:5432").await?;
-    
+
     let (mut conn, startup) = ConnectionBuilder::new("postgres")
         .database("mydb")
         .auth(AuthenticationMode::Password("secret".into()))
         .connect(stream)
         .await?;
-    
-    println!("Connected to server version: {}", 
+
+    println!("Connected to server version: {}",
         startup.parameters.get("server_version").unwrap());
-    
+
     // Execute a simple query
-    conn.put_query("SELECT version()")
-        .flush()
-        .await?;
-    
+    conn.buf().query("SELECT version()");
+    conn.flush().await?;
+
     // Read response
     loop {
-        let frame = conn.read_frame().await?;
+        let frame = conn.recv().await?;
         // Handle frame...
         if matches!(frame.code, backend::MessageCode::READY_FOR_QUERY) {
             break;
         }
     }
-    
+
     Ok(())
 }
 ```
@@ -56,32 +57,33 @@ async fn main() -> pg_stream::startup::Result<()> {
 Supported authentication modes:
 
 - `AuthenticationMode::Trust` - No password required
-- `AuthenticationMode::Password(String)` - Cleartext password authentication
-
-Other authentication methods (SASL, MD5, Kerberos, etc.) are not yet implemented.
+- `AuthenticationMode::Password(String)` - Cleartext or SCRAM-SHA-256 password authentication
 
 ## Extended Query Protocol
 
 The crate provides full support for the extended query protocol with prepared statements:
 
 ```rust
+use pg_stream::FrontendMessage;
+use pg_stream::message::oid;
+
 // Parse a prepared statement
-conn.put_parse("my_stmt", "SELECT $1::int + $2::int", &[
-    ParameterKind::Int4,
-    ParameterKind::Int4,
-])
-.flush()
-.await?;
+conn.buf()
+    .parse(Some("my_stmt"))
+    .query("SELECT $1::int + $2::int")
+    .param_types(&[oid::INT4, oid::INT4])
+    .finish();
+conn.flush().await?;
 
 // Bind parameters and execute
-conn.put_bind("", "my_stmt", &[
-    BindParameter::text("5"),
-    BindParameter::text("10"),
-], ResultFormat::Text)
-.put_execute("", None)
-.put_sync()
-.flush()
-.await?;
+conn.buf()
+    .bind("my_stmt")
+    .param(5i32)
+    .param(10i32)
+    .finish()
+    .execute("", 0)
+    .sync();
+conn.flush().await?;
 ```
 
 ## Function Calls
@@ -89,16 +91,16 @@ conn.put_bind("", "my_stmt", &[
 Call Postgres functions directly via the protocol:
 
 ```rust
-use pg_proto::messages::frontend::{FunctionArg, FormatCode};
+use pg_stream::FrontendMessage;
+use pg_stream::message::FormatCode;
 
 // Call sqrt function (OID 1344)
-conn.put_fn_call(
-    1344,
-    &[FunctionArg::text("9")],
-    FormatCode::Text
-)
-.flush()
-.await?;
+conn.buf()
+    .fn_call(1344)
+    .arg("9")
+    .result_format(FormatCode::Text)
+    .finish();
+conn.flush().await?;
 ```
 
 **Note**: Function OIDs are not guaranteed to be stable across Postgres versions or installations. Look them up dynamically via system catalogs for production use.
@@ -111,7 +113,7 @@ Connect with TLS using a custom upgrade function:
 let stream = tokio::net::TcpStream::connect("localhost:5432").await.unwrap();
 stream.set_nodelay(true).unwrap();
 
-let (pg_stream, startup) = ConnectionBuilder::new("postgres")
+let (conn, startup) = ConnectionBuilder::new("postgres")
     .connect_with_tls(stream, async |s| {
         let mut root_cert_store = tokio_rustls::rustls::RootCertStore::empty();
         let cert_bytes = pem_to_der("/certs/ca.crt").await?;
@@ -133,17 +135,17 @@ let (pg_stream, startup) = ConnectionBuilder::new("postgres")
 
 ## Protocol Messages
 
-The crate supports all major frontend protocol messages:
+The `FrontendMessage` trait provides methods for all major frontend protocol messages:
 
-- **Simple Query** - `put_query()`
-- **Parse** - `put_parse()` for prepared statements
-- **Bind** - `put_bind()` to bind parameters
-- **Describe** - `put_describe()` for statement/portal metadata
-- **Execute** - `put_execute()` to run a portal
-- **Close** - `put_close()` to deallocate resources
-- **Flush** - `put_flush()` to send buffered messages
-- **Sync** - `put_sync()` to end an extended query sequence
-- **Function Call** - `put_fn_call()` to invoke functions
+- **Simple Query** - `query()`
+- **Parse** - `parse()` builder for prepared statements
+- **Bind** - `bind()` builder to bind parameters
+- **Describe** - `describe_statement()`, `describe_portal()`
+- **Execute** - `execute()` to run a portal
+- **Close** - `close_statement()`, `close_portal()`
+- **Flush** - `flush_msg()` to send buffered messages
+- **Sync** - `sync()` to end an extended query sequence
+- **Function Call** - `fn_call()` builder to invoke functions
 
 ## Performance
 
@@ -158,6 +160,6 @@ This crate is designed for scenarios where you need maximum control and minimum 
 ## Safety and Limitations
 
 - **No SQL injection protection** - You are responsible for sanitizing inputs
-- **No connection pooling** - Single connection per `PgStream`
+- **No connection pooling** - Single connection per `PgConnection`
 - **Manual resource management** - You must close statements and portals
-- **Incomplete auth support** - Only Trust, scram, and cleartext password
+- **Incomplete auth support** - Only Trust, SCRAM-SHA-256, and cleartext password

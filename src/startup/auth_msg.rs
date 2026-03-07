@@ -1,6 +1,6 @@
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::{messages::backend, startup};
+use crate::{message::backend, startup};
 
 pub(crate) enum AuthMessage {
     Ok,

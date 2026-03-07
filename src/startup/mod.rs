@@ -1,22 +1,29 @@
 use std::collections::HashMap;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use scram::ScramClient;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::{
-    PgStream,
-    messages::{
+    PgConnection,
+    auth::{ScramClient, cleartext_password, md5_password},
+    message::{
+        MessageCode,
         backend::{self},
-        frontend,
+        codec::frame,
     },
-    startup::auth::{AuthMessage, read_auth_message},
 };
 
-mod auth;
+use self::auth_msg::{AuthMessage, read_auth_message};
+
+mod auth_msg;
 mod error;
 
 pub use error::*;
+
+pub const SSL_REQUEST: &[u8] = &[
+    0x00, 0x00, 0x00, 0x08, // length: 8
+    0x04, 0xD2, 0x16, 0x2F, // code: 80877103
+];
 
 /// Authentication mode for a Postgres connection.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -159,7 +166,7 @@ impl ConnectionBuilder {
 
     fn as_startup_message(&self) -> Bytes {
         let mut buf = BytesMut::new();
-        frontend::frame(&mut buf, |buf| {
+        frame(&mut buf, |buf| {
             buf.put_u32(self.protocol.into());
 
             for (key, val) in &self.options {
@@ -183,14 +190,14 @@ impl ConnectionBuilder {
         &self,
         mut stream: S,
         upgrade_fn: F,
-    ) -> Result<(PgStream<T>, StartupResponse)>
+    ) -> Result<(PgConnection<T>, StartupResponse)>
     where
         S: AsyncRead + AsyncWrite + Unpin,
         T: AsyncRead + AsyncWrite + Unpin,
         F: FnOnce(S) -> Fut,
         Fut: Future<Output = std::io::Result<T>>,
     {
-        stream.write_all(frontend::SSL_REQUEST).await?;
+        stream.write_all(SSL_REQUEST).await?;
         stream.flush().await?;
 
         let mut buf = [0; 1];
@@ -213,7 +220,7 @@ impl ConnectionBuilder {
     ///
     /// Performs the startup handshake, handles authentication, and waits for
     /// the server to be ready for queries.
-    pub async fn connect<S>(&self, mut stream: S) -> Result<(PgStream<S>, StartupResponse)>
+    pub async fn connect<S>(&self, mut stream: S) -> Result<(PgConnection<S>, StartupResponse)>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
@@ -242,7 +249,7 @@ impl ConnectionBuilder {
             }
         }
 
-        Ok((PgStream::from_stream(stream), startup_res))
+        Ok((PgConnection::new(stream), startup_res))
     }
 
     async fn startup<S>(&self, stream: &mut S) -> Result<()>
@@ -258,11 +265,20 @@ impl ConnectionBuilder {
                 let AuthenticationMode::Password(pw) = &self.auth else {
                     return Err(Error::PasswordRequired);
                 };
-                let mut msg = BytesMut::new();
-                frontend::MessageCode::PASSWORD_MESSAGE.frame(&mut msg, |buf| {
-                    buf.put_slice(pw.as_bytes());
-                    buf.put_u8(0);
-                });
+                let msg = cleartext_password(pw);
+                stream.write_all(&msg).await?;
+                stream.flush().await?;
+
+                match read_auth_message(stream).await? {
+                    AuthMessage::Ok => Ok(()),
+                    code => Err(format!("unexpected authentication code {code}"))?,
+                }
+            }
+            AuthMessage::Md5Password(salt) => {
+                let AuthenticationMode::Password(pw) = &self.auth else {
+                    return Err(Error::PasswordRequired);
+                };
+                let msg = md5_password(self.get_user(), pw, &salt);
                 stream.write_all(&msg).await?;
                 stream.flush().await?;
 
@@ -276,11 +292,11 @@ impl ConnectionBuilder {
                     return Err(Error::PasswordRequired);
                 };
 
-                let scram = ScramClient::new(&self.get_user(), pw, None);
-                let (scram, client_first) = scram.client_first();
+                let mut scram = ScramClient::new(self.get_user(), pw);
+                let client_first = scram.client_first();
 
                 let mut msg = BytesMut::new();
-                frontend::MessageCode::SASL_RESPONSE.frame(&mut msg, |buf| {
+                MessageCode::SASL_RESPONSE.write(&mut msg, |buf| {
                     buf.put_slice(mech.to_string().as_bytes());
                     buf.put_u8(0);
                     buf.put_u32(client_first.len() as u32);
@@ -294,13 +310,12 @@ impl ConnectionBuilder {
                     return Err(format!("unexpected authentication response {res}"))?;
                 };
 
-                let scram = scram
-                    .handle_server_first(&server_first)
+                let client_final = scram
+                    .client_final(&server_first)
                     .map_err(|e| format!("scram handshake failed: {e}"))?;
-                let (scram, client_final) = scram.client_final();
 
                 let mut msg = BytesMut::new();
-                frontend::MessageCode::SASL_RESPONSE.frame(&mut msg, |buf| {
+                MessageCode::SASL_RESPONSE.write(&mut msg, |buf| {
                     buf.put_slice(client_final.as_bytes());
                 });
                 stream.write_all(&msg).await?;
@@ -312,7 +327,7 @@ impl ConnectionBuilder {
                 };
 
                 scram
-                    .handle_server_final(&server_final)
+                    .verify_server(&server_final)
                     .map_err(|e| format!("scram handshake failed: {e}"))?;
 
                 match read_auth_message(stream).await? {
