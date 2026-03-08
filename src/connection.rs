@@ -52,7 +52,7 @@
 //! # }
 //! ```
 
-use bytes::{buf::UninitSlice, BufMut, Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut, buf::UninitSlice};
 
 #[cfg(feature = "async")]
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -260,9 +260,7 @@ mod tests {
         let mut conn = PgConnection::new(stream);
 
         // Test that chaining works directly on PgConnection
-        conn.query("SELECT 1")
-            .sync()
-            .terminate();
+        conn.query("SELECT 1").sync().terminate();
 
         assert!(conn.pending_len() > 0);
     }

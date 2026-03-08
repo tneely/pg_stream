@@ -32,6 +32,6 @@ pub(crate) mod frontend;
 
 pub use backend::{PgMessage, TransactionStatus, read_message};
 pub use frontend::{
-    BindBuilder, Bindable, FnCallBuilder, FormatCode, PgProtocol, NeedsQuery, Oid,
-    ParseBuilder, Ready, oid,
+    BindBuilder, Bindable, FnCallBuilder, FormatCode, NeedsQuery, Oid, ParseBuilder, PgProtocol,
+    Ready, oid,
 };

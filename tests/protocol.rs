@@ -1,7 +1,7 @@
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
 use pg_stream::{
-    PgProtocol, PgConnection, PgMessage,
+    PgConnection, PgMessage, PgProtocol,
     message::{Bindable, FormatCode, TransactionStatus, oid},
     startup::{AuthenticationMode, ConnectionBuilder, StartupResponse},
 };
