@@ -8,7 +8,7 @@
 use bytes::{BufMut, BytesMut};
 use md5::Context;
 
-use crate::message::{MessageCode, codec::frame};
+use crate::message::frontend::{MessageCode, frame};
 
 /// Computes the MD5 password hash for Postgres authentication.
 ///

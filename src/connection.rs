@@ -23,7 +23,7 @@
 //! conn.flush().await?;
 //!
 //! // Read response
-//! let frame = conn.recv().await?;
+//! let msg = conn.recv().await?;
 //! # Ok(())
 //! # }
 //! ```
@@ -49,7 +49,7 @@
 //! conn.flush_sync()?;
 //!
 //! // Read response
-//! let frame = conn.recv_sync()?;
+//! let msg = conn.recv_sync()?;
 //! # Ok(())
 //! # }
 //! ```
@@ -62,7 +62,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 #[cfg(feature = "sync")]
 use std::io::{Read, Write};
 
-use crate::message::backend::{self, PgFrame};
+use crate::message::backend::{self, PgMessage};
 
 /// A Postgres connection wrapping a stream with buffered message building.
 ///
@@ -173,12 +173,12 @@ impl<S: AsyncWrite + Unpin> PgConnection<S> {
 
 #[cfg(feature = "async")]
 impl<S: AsyncRead + Unpin> PgConnection<S> {
-    /// Read a single frame from the stream.
+    /// Read a single message from the stream.
     ///
-    /// This reads and parses one Postgres protocol frame from the
+    /// This reads and parses one Postgres protocol message from the
     /// underlying stream.
-    pub async fn recv(&mut self) -> std::io::Result<PgFrame> {
-        backend::read_frame(&mut self.stream).await
+    pub async fn recv(&mut self) -> std::io::Result<PgMessage> {
+        backend::read_message(&mut self.stream).await
     }
 }
 
@@ -207,12 +207,12 @@ impl<S: Write> PgConnection<S> {
 
 #[cfg(feature = "sync")]
 impl<S: Read> PgConnection<S> {
-    /// Read a single frame from the stream (synchronous version).
+    /// Read a single message from the stream (synchronous version).
     ///
-    /// This reads and parses one Postgres protocol frame from the
+    /// This reads and parses one Postgres protocol message from the
     /// underlying stream.
-    pub fn recv_sync(&mut self) -> std::io::Result<PgFrame> {
-        backend::read_frame_sync(&mut self.stream)
+    pub fn recv_sync(&mut self) -> std::io::Result<PgMessage> {
+        backend::read_message_sync(&mut self.stream)
     }
 }
 
@@ -275,14 +275,13 @@ mod tests {
 
         #[tokio::test]
         async fn test_recv() {
-            // Create a buffer with a valid frame: ReadyForQuery 'Z' + len=5 + 'I'
+            // Create a buffer with a valid message: ReadyForQuery 'Z' + len=5 + 'I'
             let input: &[u8] = &[b'Z', 0, 0, 0, 5, b'I'];
             let mut conn = PgConnection::new(input);
 
-            let frame = conn.recv().await.unwrap();
+            let msg = conn.recv().await.unwrap();
 
-            assert_eq!(frame.code, backend::MessageCode::READY_FOR_QUERY);
-            assert_eq!(&frame.body[..], &[b'I']);
+            assert!(matches!(msg, PgMessage::ReadyForQuery(_)));
         }
     }
 
@@ -306,14 +305,13 @@ mod tests {
 
         #[test]
         fn test_recv_sync() {
-            // Create a buffer with a valid frame: ReadyForQuery 'Z' + len=5 + 'I'
+            // Create a buffer with a valid message: ReadyForQuery 'Z' + len=5 + 'I'
             let input: &[u8] = &[b'Z', 0, 0, 0, 5, b'I'];
             let mut conn = PgConnection::new(Cursor::new(input));
 
-            let frame = conn.recv_sync().unwrap();
+            let msg = conn.recv_sync().unwrap();
 
-            assert_eq!(frame.code, backend::MessageCode::READY_FOR_QUERY);
-            assert_eq!(&frame.body[..], &[b'I']);
+            assert!(matches!(msg, PgMessage::ReadyForQuery(_)));
         }
     }
 }

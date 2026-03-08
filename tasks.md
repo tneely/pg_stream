@@ -207,10 +207,10 @@
 - [ ] Add `copy_fail(&mut self, msg: &str) -> &mut Self`
 
 ### 7.2 Backend parsers
-- [ ] Create `CopyInResponse` parser
-- [ ] Create `CopyOutResponse` parser
-- [ ] Create `CopyBothResponse` parser
-- [ ] Create `CopyData` wrapper
+- [x] Create `CopyInResponse` parser
+- [x] Create `CopyOutResponse` parser
+- [x] Create `CopyBothResponse` parser
+- [x] Create `CopyData` wrapper
 
 ---
 

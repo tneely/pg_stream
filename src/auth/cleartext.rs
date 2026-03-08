@@ -5,10 +5,7 @@
 
 use bytes::{BufMut, BytesMut};
 
-use crate::message::{
-    MessageCode,
-    codec::{cstring_len, frame},
-};
+use crate::message::frontend::{MessageCode, cstring_len, frame};
 
 /// Encodes a cleartext password message.
 ///

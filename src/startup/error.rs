@@ -1,4 +1,4 @@
-use crate::PgErrorResponse;
+use crate::ErrorResponse;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -9,7 +9,7 @@ pub enum Error {
     Io(std::io::Error),
     PasswordRequired,
     TlsUnsupported,
-    Server(PgErrorResponse),
+    Server(Box<ErrorResponse>),
     Unexpected(String),
 }
 

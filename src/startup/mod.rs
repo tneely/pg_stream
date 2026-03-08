@@ -1,15 +1,14 @@
 use std::collections::HashMap;
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::{
-    PgConnection,
+    PgConnection, PgMessage,
     auth::{ScramClient, cleartext_password, md5_password},
     message::{
-        MessageCode,
         backend::{self},
-        codec::{cstring_len, frame},
+        frontend::{MessageCode, cstring_len, frame},
     },
 };
 
@@ -241,19 +240,19 @@ impl ConnectionBuilder {
         };
 
         loop {
-            let mut frame = backend::read_frame(&mut stream).await?;
-            match frame.code {
-                backend::MessageCode::PARAMETER_STATUS => {
-                    let key = backend::read_cstring(&mut frame.body)?;
-                    let val = backend::read_cstring(&mut frame.body)?;
-                    startup_res.parameters.insert(key, val);
+            let msg = backend::read_message(&mut stream).await?;
+            match msg {
+                PgMessage::ParameterStatus(ps) => {
+                    startup_res
+                        .parameters
+                        .insert(ps.name().into_owned(), ps.value().into_owned());
                 }
-                backend::MessageCode::BACKEND_KEY_DATA => {
-                    startup_res.process_id = frame.body.get_u32();
-                    startup_res.secret_key = frame.body.get_u32();
+                PgMessage::BackendKeyData(bkd) => {
+                    startup_res.process_id = bkd.process_id();
+                    startup_res.secret_key = bkd.secret_key();
                 }
-                backend::MessageCode::READY_FOR_QUERY => break,
-                code => Err(format!("unexpected message code {code}"))?,
+                PgMessage::ReadyForQuery(_) => break,
+                msg => Err(format!("unexpected message: {:?}", msg))?,
             }
         }
 

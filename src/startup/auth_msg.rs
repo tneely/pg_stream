@@ -1,6 +1,7 @@
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::{message::backend, startup};
+use crate::{PgMessage, message::backend, startup};
+use bytes::Bytes;
 
 pub(crate) enum AuthMessage {
     Ok,
@@ -66,48 +67,47 @@ pub(crate) async fn read_auth_message<S>(stream: &mut S) -> startup::Result<Auth
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let msg = backend::read_frame(stream).await?;
+    let msg = backend::read_message(stream).await?;
 
-    match msg.code {
-        backend::MessageCode::ERROR_RESPONSE => {
-            let pg_err = msg.try_into().expect("is an error response");
-            Err(startup::Error::Server(pg_err))
-        }
-        backend::MessageCode::AUTHENTICATION => {
-            let auth_code = u32::from_be_bytes(msg.body[..4].try_into().unwrap());
-            let msg = match auth_code {
-                0 => AuthMessage::Ok,
-                2 => AuthMessage::KerberosV5,
-                3 => AuthMessage::CleartextPassword,
-                5 => {
-                    let salt = msg.body[4..]
-                        .try_into()
-                        .map_err(|_| "unexpected body length in md5 password challenge")?;
-                    AuthMessage::Md5Password(salt)
-                }
-                7 => AuthMessage::Gss,
-                8 => AuthMessage::GssContinue,
-                9 => AuthMessage::Sspi,
-                10 => {
-                    let mech = msg.body[4..]
-                        .split(|b| *b == 0)
-                        .map(String::from_utf8_lossy)
-                        .find_map(|m| AuthMechanism::try_from(m.as_ref()).ok())
-                        .ok_or("no supported authentication mechanisms")?;
-                    AuthMessage::Sasl(mech)
-                }
-                11 => {
-                    let resp = &msg.body[4..];
-                    AuthMessage::SaslContinue(String::from_utf8_lossy(resp).to_string())
-                }
-                12 => {
-                    let resp = &msg.body[4..];
-                    AuthMessage::SaslFinal(String::from_utf8_lossy(resp).to_string())
-                }
-                auth_code => Err(format!("unexpected auth response code {auth_code}",))?,
-            };
-            Ok(msg)
-        }
-        code => Err(format!("unexpected message code {code}"))?,
+    match msg {
+        PgMessage::ErrorResponse(pg_err) => Err(startup::Error::Server(Box::new(pg_err))),
+        PgMessage::Authentication(body) => parse_auth_body(body),
+        msg => Err(format!("unexpected message: {:?}", msg))?,
     }
+}
+
+fn parse_auth_body(body: Bytes) -> startup::Result<AuthMessage> {
+    let auth_code = u32::from_be_bytes(body[..4].try_into().unwrap());
+    let msg = match auth_code {
+        0 => AuthMessage::Ok,
+        2 => AuthMessage::KerberosV5,
+        3 => AuthMessage::CleartextPassword,
+        5 => {
+            let salt = body[4..]
+                .try_into()
+                .map_err(|_| "unexpected body length in md5 password challenge")?;
+            AuthMessage::Md5Password(salt)
+        }
+        7 => AuthMessage::Gss,
+        8 => AuthMessage::GssContinue,
+        9 => AuthMessage::Sspi,
+        10 => {
+            let mech = body[4..]
+                .split(|b| *b == 0)
+                .map(String::from_utf8_lossy)
+                .find_map(|m| AuthMechanism::try_from(m.as_ref()).ok())
+                .ok_or("no supported authentication mechanisms")?;
+            AuthMessage::Sasl(mech)
+        }
+        11 => {
+            let resp = &body[4..];
+            AuthMessage::SaslContinue(String::from_utf8_lossy(resp).to_string())
+        }
+        12 => {
+            let resp = &body[4..];
+            AuthMessage::SaslFinal(String::from_utf8_lossy(resp).to_string())
+        }
+        auth_code => Err(format!("unexpected auth response code {auth_code}",))?,
+    };
+    Ok(msg)
 }

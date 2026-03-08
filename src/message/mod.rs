@@ -3,7 +3,8 @@
 //! This module provides:
 //!
 //! - [`FrontendMessage`] - Extension trait for writing frontend messages to any buffer
-//! - [`codec`] - Low-level framing utilities and type definitions
+//! - [`backend`] - Backend message parsing and types
+//! - [`frontend`] - Frontend message encoding and types
 //!
 //! # Example
 //!
@@ -26,11 +27,11 @@
 //!    .sync();
 //! ```
 
-pub mod backend;
-pub mod codec;
-mod frontend;
+pub(crate) mod backend;
+pub(crate) mod frontend;
 
-pub use codec::{FormatCode, MessageCode, Oid, oid};
+pub use backend::{PgMessage, TransactionStatus, read_message};
 pub use frontend::{
-    BindBuilder, Bindable, FnCallBuilder, FrontendMessage, NeedsQuery, ParseBuilder, Ready,
+    BindBuilder, Bindable, FnCallBuilder, FormatCode, FrontendMessage, NeedsQuery, Oid,
+    ParseBuilder, Ready, oid,
 };

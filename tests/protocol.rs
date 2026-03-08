@@ -1,8 +1,8 @@
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
 use pg_stream::{
-    FrontendMessage, PgConnection, PgErrorResponse,
-    message::{Bindable, FormatCode, backend, oid},
+    FrontendMessage, PgConnection, PgMessage,
+    message::{Bindable, FormatCode, TransactionStatus, oid},
     startup::{AuthenticationMode, ConnectionBuilder, StartupResponse},
 };
 use postgresql_embedded::{PostgreSQL, Settings, Status};
@@ -44,8 +44,8 @@ async fn run_pg() -> &'static PostgreSQL {
             conn.flush().await?;
 
             loop {
-                let frame = conn.recv().await?;
-                if frame.code == backend::MessageCode::READY_FOR_QUERY {
+                let msg = conn.recv().await?;
+                if matches!(msg, PgMessage::ReadyForQuery(_)) {
                     break;
                 }
             }
@@ -217,8 +217,8 @@ async fn test_pg_extended_protocol() {
     conn.flush().await.unwrap();
 
     // Expect ParseComplete
-    let frame = conn.recv().await.unwrap();
-    assert_eq!(frame.code, backend::MessageCode::PARSE_COMPLETE);
+    let msg = conn.recv().await.unwrap();
+    assert!(matches!(msg, PgMessage::ParseComplete));
 
     //
     // 2. Bind to create a named portal
@@ -231,8 +231,8 @@ async fn test_pg_extended_protocol() {
     conn.flush().await.unwrap();
 
     // Expect BindComplete
-    let frame = conn.recv().await.unwrap();
-    assert_eq!(frame.code, backend::MessageCode::BIND_COMPLETE);
+    let msg = conn.recv().await.unwrap();
+    assert!(matches!(msg, PgMessage::BindComplete));
 
     //
     // 3. Describe the portal
@@ -241,11 +241,13 @@ async fn test_pg_extended_protocol() {
     conn.flush().await.unwrap();
 
     // Expect RowDescription
-    let frame = conn.recv().await.unwrap();
-    assert_eq!(frame.code, backend::MessageCode::ROW_DESCRIPTION);
+    let msg = conn.recv().await.unwrap();
+    let PgMessage::RowDescription(desc) = msg else {
+        panic!("expected RowDescription, got {:?}", msg);
+    };
     // For "SELECT $1::int + 1", we expect one column: "?column?"
-    let col = b"?column?";
-    assert!(frame.body.windows(col.len()).any(|w| w == col));
+    assert_eq!(desc.column_count(), 1);
+    assert_eq!(desc.column_name(0).unwrap(), "?column?");
 
     //
     // 4. Execute the portal
@@ -254,14 +256,18 @@ async fn test_pg_extended_protocol() {
     conn.flush().await.unwrap();
 
     // Expect DataRow + CommandComplete
-    let frame = conn.recv().await.unwrap();
-    assert_eq!(frame.code, backend::MessageCode::DATA_ROW);
+    let msg = conn.recv().await.unwrap();
+    let PgMessage::DataRow(row) = msg else {
+        panic!("expected DataRow, got {:?}", msg);
+    };
     // The value should be "3" since 2 + 1 = 3
-    assert_eq!(&frame.body[6..], b"3");
+    assert_eq!(row.column(0), Some(b"3".as_slice()));
 
-    let frame = conn.recv().await.unwrap();
-    assert_eq!(frame.code, backend::MessageCode::COMMAND_COMPLETE);
-    assert_eq!(frame.body, b"SELECT 1\0".as_ref());
+    let msg = conn.recv().await.unwrap();
+    let PgMessage::CommandComplete(cmd) = msg else {
+        panic!("expected CommandComplete, got {:?}", msg);
+    };
+    assert_eq!(cmd.tag(), "SELECT 1");
 
     //
     // 5. Close both portal and statement
@@ -273,11 +279,11 @@ async fn test_pg_extended_protocol() {
     conn.flush().await.unwrap();
 
     // Expect two CloseComplete
-    let frame = conn.recv().await.unwrap();
-    assert_eq!(frame.code, backend::MessageCode::CLOSE_COMPLETE);
+    let msg = conn.recv().await.unwrap();
+    assert!(matches!(msg, PgMessage::CloseComplete));
 
-    let frame = conn.recv().await.unwrap();
-    assert_eq!(frame.code, backend::MessageCode::CLOSE_COMPLETE);
+    let msg = conn.recv().await.unwrap();
+    assert!(matches!(msg, PgMessage::CloseComplete));
 
     //
     // 6. Sync (end of extended protocol)
@@ -285,9 +291,11 @@ async fn test_pg_extended_protocol() {
     conn.buf().sync();
     conn.flush().await.unwrap();
 
-    let frame = conn.recv().await.unwrap();
-    assert_eq!(frame.code, backend::MessageCode::READY_FOR_QUERY);
-    assert_eq!(frame.body, b"I".as_ref());
+    let msg = conn.recv().await.unwrap();
+    let PgMessage::ReadyForQuery(rfq) = msg else {
+        panic!("expected ReadyForQuery, got {:?}", msg);
+    };
+    assert_eq!(rfq.status(), TransactionStatus::Idle);
 }
 
 #[tokio::test]
@@ -298,20 +306,26 @@ async fn test_put_query_select_1() {
     conn.buf().query("SELECT 1").flush_msg();
     conn.flush().await.unwrap();
 
-    let frame = conn.recv().await.unwrap();
-    assert_eq!(frame.code, backend::MessageCode::ROW_DESCRIPTION);
-    assert!(!frame.body.is_empty());
+    let msg = conn.recv().await.unwrap();
+    let PgMessage::RowDescription(desc) = msg else {
+        panic!("expected RowDescription, got {:?}", msg);
+    };
+    assert!(desc.column_count() > 0);
 
-    let frame = conn.recv().await.unwrap();
-    assert_eq!(frame.code, backend::MessageCode::DATA_ROW);
-    assert_eq!(&frame.body[6..], b"1".as_ref());
+    let msg = conn.recv().await.unwrap();
+    let PgMessage::DataRow(row) = msg else {
+        panic!("expected DataRow, got {:?}", msg);
+    };
+    assert_eq!(row.column(0), Some(b"1".as_slice()));
 
-    let frame = conn.recv().await.unwrap();
-    assert_eq!(frame.code, backend::MessageCode::COMMAND_COMPLETE);
-    assert_eq!(frame.body, b"SELECT 1\0".as_ref());
+    let msg = conn.recv().await.unwrap();
+    let PgMessage::CommandComplete(cmd) = msg else {
+        panic!("expected CommandComplete, got {:?}", msg);
+    };
+    assert_eq!(cmd.tag(), "SELECT 1");
 
-    let frame = conn.recv().await.unwrap();
-    assert_eq!(frame.code, backend::MessageCode::READY_FOR_QUERY);
+    let msg = conn.recv().await.unwrap();
+    assert!(matches!(msg, PgMessage::ReadyForQuery(_)));
 }
 
 #[tokio::test]
@@ -328,13 +342,15 @@ async fn test_put_fn_call_sqrt() {
     conn.flush().await.unwrap();
 
     // 1. Expect FunctionCallResponse
-    let frame = conn.recv().await.unwrap();
-    assert_eq!(frame.code, backend::MessageCode::FUNCTION_CALL_RESPONSE);
-    assert_eq!(&frame.body[4..], b"3".as_ref());
+    let msg = conn.recv().await.unwrap();
+    let PgMessage::FunctionCallResponse(body) = msg else {
+        panic!("expected FunctionCallResponse, got {:?}", msg);
+    };
+    assert_eq!(&body[4..], b"3".as_ref());
 
     // 2. Expect ReadyForQuery
-    let frame = conn.recv().await.unwrap();
-    assert_eq!(frame.code, backend::MessageCode::READY_FOR_QUERY);
+    let msg = conn.recv().await.unwrap();
+    assert!(matches!(msg, PgMessage::ReadyForQuery(_)));
 }
 
 #[tokio::test]
@@ -345,16 +361,18 @@ async fn test_parse_error_response() {
     conn.buf().query("SELECT * FROM fake_table");
     conn.flush().await.unwrap();
 
-    let frame = conn.recv().await.unwrap();
-    let err: PgErrorResponse = frame.try_into().unwrap();
+    let msg = conn.recv().await.unwrap();
+    let PgMessage::ErrorResponse(err) = msg else {
+        panic!("expected ErrorResponse, got {:?}", msg);
+    };
 
-    assert_eq!(Some("ERROR".into()), err.local_severity());
-    assert_eq!(Some("ERROR".into()), err.severity());
-    assert_eq!(Some("42P01".into()), err.code());
-    assert_eq!(
-        Some("relation \"fake_table\" does not exist".into()),
-        err.message()
-    );
+    // Required fields return Cow directly (not Option)
+    assert_eq!("ERROR", err.local_severity());
+    assert_eq!("ERROR", err.severity());
+    assert_eq!("42P01", err.code());
+    assert_eq!("relation \"fake_table\" does not exist", err.message());
+
+    // Optional fields return Option<Cow>
     assert_eq!(None, err.detail());
     assert_eq!(None, err.hint());
     assert_eq!(Some("15".into()), err.position());
@@ -368,8 +386,8 @@ async fn test_parse_error_response() {
         err.to_string()
     );
     assert_eq!(
-        "PgErrorResponse { local_severity: Some(\"ERROR\"), severity: Some(\"ERROR\"), \
-        code: Some(\"42P01\"), message: Some(\"relation \\\"fake_table\\\" does not exist\"), \
+        "ErrorResponse { local_severity: \"ERROR\", severity: \"ERROR\", \
+        code: \"42P01\", message: \"relation \\\"fake_table\\\" does not exist\", \
         detail: None, hint: None, position: Some(\"15\"), where: None, \
         file: Some(\"parse_relation.c\"), line: Some(\"1452\"), \
         routine: Some(\"parserOpenTable\"), .. }",

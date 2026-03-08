@@ -5,7 +5,7 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 
 use pg_stream::{
     FrontendMessage,
-    message::{Bindable, FormatCode, backend, oid},
+    message::{Bindable, FormatCode, oid, read_message},
 };
 
 fn bench_put_query(c: &mut Criterion) {
@@ -252,10 +252,10 @@ fn bench_chained_operations(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_read_frame(c: &mut Criterion) {
-    let mut group = c.benchmark_group("read_frame");
+fn bench_read_message(c: &mut Criterion) {
+    let mut group = c.benchmark_group("read_message");
+    let rt = tokio::runtime::Runtime::new().unwrap();
 
-    // Helper function to create a frame buffer
     fn create_frame(code: u8, body: &[u8]) -> Vec<u8> {
         let mut buf = Vec::new();
         buf.push(code);
@@ -264,74 +264,123 @@ fn bench_read_frame(c: &mut Criterion) {
         buf
     }
 
-    group.bench_function("empty_body", |b| {
-        let frame = create_frame(b'Z', b"");
+    let ready_for_query = create_frame(b'Z', &[b'I']);
+    group.bench_function("ready_for_query_idle", |b| {
         b.iter(|| {
-            let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
-                let stream = black_box(frame.as_slice());
-                backend::read_frame(stream).await.unwrap()
+                let stream = black_box(ready_for_query.as_slice());
+                read_message(stream).await.unwrap()
             })
-        });
+        })
     });
 
-    group.bench_function("small_body_5_bytes", |b| {
-        let frame = create_frame(b'Z', b"READY");
+    let command_complete = create_frame(b'C', b"SELECT 1\0");
+    group.bench_function("command_complete_select", |b| {
         b.iter(|| {
-            let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
-                let stream = black_box(frame.as_slice());
-                backend::read_frame(stream).await.unwrap()
+                let stream = black_box(command_complete.as_slice());
+                read_message(stream).await.unwrap()
             })
-        });
+        })
     });
 
-    group.bench_function("medium_body_100_bytes", |b| {
-        let body = vec![b'x'; 100];
-        let frame = create_frame(b'D', &body);
+    let mut parameter_status_body = Vec::new();
+    parameter_status_body.extend_from_slice(b"server_version");
+    parameter_status_body.push(0);
+    parameter_status_body.extend_from_slice(b"16.0");
+    parameter_status_body.push(0);
+    let parameter_status = create_frame(b'S', &parameter_status_body);
+    group.bench_function("parameter_status", |b| {
         b.iter(|| {
-            let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
-                let stream = black_box(frame.as_slice());
-                backend::read_frame(stream).await.unwrap()
+                let stream = black_box(parameter_status.as_slice());
+                read_message(stream).await.unwrap()
             })
-        });
+        })
     });
 
-    group.bench_function("large_body_1kb", |b| {
-        let body = vec![b'x'; 1024];
-        let frame = create_frame(b'D', &body);
+    let mut backend_key_data_body = Vec::new();
+    backend_key_data_body.extend_from_slice(&12345_u32.to_be_bytes());
+    backend_key_data_body.extend_from_slice(&67890_u32.to_be_bytes());
+    let backend_key_data = create_frame(b'K', &backend_key_data_body);
+    group.bench_function("backend_key_data", |b| {
         b.iter(|| {
-            let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
-                let stream = black_box(frame.as_slice());
-                backend::read_frame(stream).await.unwrap()
+                let stream = black_box(backend_key_data.as_slice());
+                read_message(stream).await.unwrap()
             })
-        });
+        })
     });
 
-    group.bench_function("large_body_10kb", |b| {
-        let body = vec![b'x'; 10 * 1024];
-        let frame = create_frame(b'D', &body);
+    let mut row_description_body = Vec::new();
+    row_description_body.extend_from_slice(&1_u16.to_be_bytes());
+    row_description_body.extend_from_slice(b"id");
+    row_description_body.push(0);
+    row_description_body.extend_from_slice(&0_u32.to_be_bytes());
+    row_description_body.extend_from_slice(&0_u16.to_be_bytes());
+    row_description_body.extend_from_slice(&23_u32.to_be_bytes());
+    row_description_body.extend_from_slice(&4_i16.to_be_bytes());
+    row_description_body.extend_from_slice(&(-1_i32).to_be_bytes());
+    row_description_body.extend_from_slice(&0_u16.to_be_bytes());
+    let row_description = create_frame(b'T', &row_description_body);
+    group.bench_function("row_description_single_column", |b| {
         b.iter(|| {
-            let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
-                let stream = black_box(frame.as_slice());
-                backend::read_frame(stream).await.unwrap()
+                let stream = black_box(row_description.as_slice());
+                read_message(stream).await.unwrap()
             })
-        });
+        })
     });
 
-    group.bench_function("large_body_100kb", |b| {
-        let body = vec![b'x'; 100 * 1024];
-        let frame = create_frame(b'D', &body);
+    let mut data_row_body = Vec::new();
+    data_row_body.extend_from_slice(&2_u16.to_be_bytes());
+    data_row_body.extend_from_slice(&5_i32.to_be_bytes());
+    data_row_body.extend_from_slice(b"hello");
+    data_row_body.extend_from_slice(&(-1_i32).to_be_bytes());
+    let data_row = create_frame(b'D', &data_row_body);
+    group.bench_function("data_row_two_columns", |b| {
         b.iter(|| {
-            let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
-                let stream = black_box(frame.as_slice());
-                backend::read_frame(stream).await.unwrap()
+                let stream = black_box(data_row.as_slice());
+                read_message(stream).await.unwrap()
             })
-        });
+        })
+    });
+
+    let mut error_response_body = Vec::new();
+    error_response_body.extend_from_slice(b"SERROR\0");
+    error_response_body.extend_from_slice(b"VERROR\0");
+    error_response_body.extend_from_slice(b"C42601\0");
+    error_response_body.extend_from_slice(b"Msyntax error at or near \"SELECT\"\0");
+    error_response_body.push(0);
+    let error_response = create_frame(b'E', &error_response_body);
+    group.bench_function("error_response", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let stream = black_box(error_response.as_slice());
+                read_message(stream).await.unwrap()
+            })
+        })
+    });
+
+    let copy_data_1kb = create_frame(b'd', &vec![b'x'; 1024]);
+    group.bench_function("copy_data_1kb", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let stream = black_box(copy_data_1kb.as_slice());
+                read_message(stream).await.unwrap()
+            })
+        })
+    });
+
+    let copy_data_100kb = create_frame(b'd', &vec![b'x'; 100 * 1024]);
+    group.bench_function("copy_data_100kb", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let stream = black_box(copy_data_100kb.as_slice());
+                read_message(stream).await.unwrap()
+            })
+        })
     });
 
     group.finish();
@@ -346,6 +395,6 @@ criterion_group!(
     bench_put_execute,
     bench_put_fn_call,
     bench_chained_operations,
-    bench_read_frame,
+    bench_read_message,
 );
 criterion_main!(benches);

@@ -115,9 +115,8 @@ pub mod auth;
 pub mod startup;
 
 pub mod connection;
-mod error;
 pub mod message;
 
 pub use connection::PgConnection;
-pub use error::*;
 pub use message::FrontendMessage;
+pub use message::backend::{ErrorResponse, PgMessage};
