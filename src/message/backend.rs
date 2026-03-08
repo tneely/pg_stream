@@ -279,7 +279,7 @@ impl ParseError {
 /// # Example
 ///
 /// ```rust,no_run
-/// use pg_stream::messages::backend::{DataRow, PgFrame};
+/// use pg_stream::message::backend::{DataRow, PgFrame};
 ///
 /// # fn example(frame: PgFrame) -> Result<(), Box<dyn std::error::Error>> {
 /// let row = DataRow::try_from(frame)?;
@@ -426,7 +426,7 @@ pub struct ColumnDesc {
 /// # Example
 ///
 /// ```rust,no_run
-/// use pg_stream::messages::backend::{RowDescription, PgFrame};
+/// use pg_stream::message::backend::{RowDescription, PgFrame};
 ///
 /// # fn example(frame: PgFrame) -> Result<(), Box<dyn std::error::Error>> {
 /// let desc = RowDescription::try_from(frame)?;
@@ -528,7 +528,7 @@ impl TryFrom<PgFrame> for RowDescription {
 /// # Example
 ///
 /// ```rust,no_run
-/// use pg_stream::messages::backend::{CommandComplete, PgFrame};
+/// use pg_stream::message::backend::{CommandComplete, PgFrame};
 ///
 /// # fn example(frame: PgFrame) -> Result<(), Box<dyn std::error::Error>> {
 /// let complete = CommandComplete::try_from(frame)?;
@@ -599,7 +599,7 @@ impl TryFrom<PgFrame> for CommandComplete {
 /// # Example
 ///
 /// ```rust,no_run
-/// use pg_stream::messages::backend::{NotificationResponse, PgFrame};
+/// use pg_stream::message::backend::{NotificationResponse, PgFrame};
 ///
 /// # fn example(frame: PgFrame) -> Result<(), Box<dyn std::error::Error>> {
 /// let notification = NotificationResponse::try_from(frame)?;
@@ -677,7 +677,7 @@ impl TryFrom<PgFrame> for NotificationResponse {
 /// # Example
 ///
 /// ```rust,no_run
-/// use pg_stream::messages::backend::{ParameterDescription, PgFrame};
+/// use pg_stream::message::backend::{ParameterDescription, PgFrame};
 ///
 /// # fn example(frame: PgFrame) -> Result<(), Box<dyn std::error::Error>> {
 /// let desc = ParameterDescription::try_from(frame)?;

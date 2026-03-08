@@ -5,7 +5,10 @@
 
 use bytes::{BufMut, BytesMut};
 
-use crate::message::MessageCode;
+use crate::message::{
+    MessageCode,
+    codec::{cstring_len, frame},
+};
 
 /// Encodes a cleartext password message.
 ///
@@ -25,7 +28,8 @@ use crate::message::MessageCode;
 /// ```
 pub fn cleartext_password(password: &str) -> BytesMut {
     let mut msg = BytesMut::new();
-    MessageCode::PASSWORD_MESSAGE.write(&mut msg, |buf| {
+    msg.put_u8(MessageCode::PASSWORD_MESSAGE.as_u8());
+    frame(&mut msg, cstring_len(password.as_bytes()), |buf| {
         buf.put_slice(password.as_bytes());
         buf.put_u8(0);
     });

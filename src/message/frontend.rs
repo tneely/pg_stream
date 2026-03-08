@@ -4,7 +4,10 @@ use std::marker::PhantomData;
 
 use bytes::BufMut;
 
-use crate::message::codec::{FormatCode, MessageCode, Oid, put_cstring};
+use crate::{
+    message::codec::{FormatCode, MessageCode, Oid, cstring_len, frame, put_cstring},
+    pg_frame,
+};
 
 /// Extension trait for writing Postgres frontend protocol messages.
 ///
@@ -24,27 +27,25 @@ use crate::message::codec::{FormatCode, MessageCode, Oid, put_cstring};
 pub trait FrontendMessage: BufMut + Sized {
     /// Write a simple Query message.
     fn query(&mut self, stmt: &str) -> &mut Self {
-        MessageCode::QUERY.write(self, |buf| {
-            put_cstring(buf, stmt.as_bytes());
-        });
+        pg_frame!(self, MessageCode::QUERY, cstring(stmt));
         self
     }
 
     /// Write a Sync message.
     fn sync(&mut self) -> &mut Self {
-        MessageCode::SYNC.write(self, |_: &mut Vec<u8>| {});
+        pg_frame!(self, MessageCode::SYNC);
         self
     }
 
     /// Write a Flush message.
     fn flush_msg(&mut self) -> &mut Self {
-        MessageCode::FLUSH.write(self, |_: &mut Vec<u8>| {});
+        pg_frame!(self, MessageCode::FLUSH);
         self
     }
 
     /// Write a Terminate message.
     fn terminate(&mut self) -> &mut Self {
-        MessageCode::TERMINATE.write(self, |_: &mut Vec<u8>| {});
+        pg_frame!(self, MessageCode::TERMINATE);
         self
     }
 
@@ -52,10 +53,12 @@ pub trait FrontendMessage: BufMut + Sized {
     ///
     /// Specify `None` to execute an unnamed portal.
     fn execute(&mut self, portal: Option<&str>, max_rows: u32) -> &mut Self {
-        MessageCode::EXECUTE.write(self, |buf| {
-            put_cstring(buf, portal.unwrap_or("").as_bytes());
-            buf.put_u32(max_rows);
-        });
+        pg_frame!(
+            self,
+            MessageCode::EXECUTE,
+            cstring(portal.unwrap_or("")),
+            u32(max_rows)
+        );
         self
     }
 
@@ -63,10 +66,12 @@ pub trait FrontendMessage: BufMut + Sized {
     ///
     /// Specify `None` to describe an unnamed portal.
     fn describe_portal(&mut self, name: Option<&str>) -> &mut Self {
-        MessageCode::DESCRIBE.write(self, |buf| {
-            buf.put_u8(b'P');
-            put_cstring(buf, name.unwrap_or("").as_bytes());
-        });
+        pg_frame!(
+            self,
+            MessageCode::DESCRIBE,
+            u8(b'P'),
+            cstring(name.unwrap_or(""))
+        );
         self
     }
 
@@ -74,10 +79,12 @@ pub trait FrontendMessage: BufMut + Sized {
     ///
     /// Specify `None` to describe an unnamed statement.
     fn describe_statement(&mut self, name: Option<&str>) -> &mut Self {
-        MessageCode::DESCRIBE.write(self, |buf| {
-            buf.put_u8(b'S');
-            put_cstring(buf, name.unwrap_or("").as_bytes());
-        });
+        pg_frame!(
+            self,
+            MessageCode::DESCRIBE,
+            u8(b'S'),
+            cstring(name.unwrap_or(""))
+        );
         self
     }
 
@@ -85,10 +92,12 @@ pub trait FrontendMessage: BufMut + Sized {
     ///
     /// Specify `None` to prepare an unnamed portal.
     fn close_portal(&mut self, name: Option<&str>) -> &mut Self {
-        MessageCode::CLOSE.write(self, |buf| {
-            buf.put_u8(b'P');
-            put_cstring(buf, name.unwrap_or("").as_bytes());
-        });
+        pg_frame!(
+            self,
+            MessageCode::CLOSE,
+            u8(b'P'),
+            cstring(name.unwrap_or(""))
+        );
         self
     }
 
@@ -96,10 +105,12 @@ pub trait FrontendMessage: BufMut + Sized {
     ///
     /// Specify `None` to close an unnamed statement.
     fn close_statement(&mut self, name: Option<&str>) -> &mut Self {
-        MessageCode::CLOSE.write(self, |buf| {
-            buf.put_u8(b'S');
-            put_cstring(buf, name.unwrap_or("").as_bytes());
-        });
+        pg_frame!(
+            self,
+            MessageCode::CLOSE,
+            u8(b'S'),
+            cstring(name.unwrap_or(""))
+        );
         self
     }
 
@@ -112,7 +123,7 @@ pub trait FrontendMessage: BufMut + Sized {
 
     /// Start building a Bind message.
     ///
-    /// Specify `None` to bind an unnamed portal.
+    /// Specify `None` to bind to an unnamed portal.
     fn bind<'a>(&'a mut self, name: Option<&'a str>) -> BindBuilder<'a, Self> {
         BindBuilder::new(self, name)
     }
@@ -186,7 +197,13 @@ impl<'a, B: BufMut> ParseBuilder<'a, B, Ready> {
 
     /// Finish building and write the Parse message.
     pub fn finish(self) -> &'a mut B {
-        MessageCode::PARSE.write(self.buf, |buf| {
+        let payload_len = cstring_len(self.name.unwrap_or("").as_bytes())
+            + cstring_len(self.query.as_bytes())
+            + 2
+            + self.param_types.len() * 4;
+
+        self.buf.put_u8(MessageCode::PARSE.as_u8());
+        frame(self.buf, payload_len, |buf| {
             put_cstring(buf, self.name.unwrap_or("").as_bytes());
             put_cstring(buf, self.query.as_bytes());
             buf.put_u16(self.param_types.len() as u16);
@@ -207,8 +224,8 @@ impl<'a, B: BufMut> ParseBuilder<'a, B, Ready> {
 /// use pg_stream::message::{FrontendMessage, FormatCode, Bindable};
 ///
 /// let mut buf = BytesMut::new();
-/// buf.bind(Some("stmt1"))
-///    .portal("portal1")
+/// buf.bind(Some("portal1"))
+///    .statement("stmt1")
 ///    .result_format(FormatCode::Binary)
 ///    .finish(&[&42i32 as &dyn Bindable, &"hello" as &dyn Bindable]);
 /// ```
@@ -246,8 +263,19 @@ impl<'a, B: BufMut> BindBuilder<'a, B> {
         let portal = self.portal;
         let statement = self.statement;
         let result_format = self.result_format;
+        let payload_len = cstring_len(portal.as_bytes())
+            + cstring_len(statement.as_bytes())
+            + format_codes_len(params.iter().map(|p| p.format_code()))
+            + 2
+            + params.iter().map(|p| p.encoded_len()).sum::<usize>()
+            + if result_format == FormatCode::Text {
+                2
+            } else {
+                4
+            };
 
-        MessageCode::BIND.write(self.buf, |buf| {
+        self.buf.put_u8(MessageCode::BIND.as_u8());
+        frame(self.buf, payload_len, |buf| {
             put_cstring(buf, portal.as_bytes());
             put_cstring(buf, statement.as_bytes());
 
@@ -311,8 +339,14 @@ impl<'a, B: BufMut> FnCallBuilder<'a, B> {
     pub fn finish(self, args: &[&dyn Bindable]) -> &'a mut B {
         let oid = self.oid;
         let result_format = self.result_format;
+        let payload_len = 4
+            + format_codes_len(args.iter().map(|a| a.format_code()))
+            + 2
+            + args.iter().map(|a| a.encoded_len()).sum::<usize>()
+            + 2;
 
-        MessageCode::FUNCTION_CALL.write(self.buf, |buf| {
+        self.buf.put_u8(MessageCode::FUNCTION_CALL.as_u8());
+        frame(self.buf, payload_len, |buf| {
             buf.put_u32(oid);
 
             // First pass: format codes
@@ -336,6 +370,15 @@ pub trait Bindable {
     /// Returns the format code for this parameter type.
     fn format_code(&self) -> FormatCode;
 
+    /// Returns encoded length including the 4-byte value length prefix.
+    ///
+    /// Override this for custom types to avoid fallback measurement cost.
+    fn encoded_len(&self) -> usize {
+        let mut counter = LenCounter::default();
+        self.encode(&mut counter);
+        counter.len
+    }
+
     /// Encode this value to the buffer (including 4-byte length prefix).
     fn encode(&self, buf: &mut dyn BufMut);
 }
@@ -343,6 +386,9 @@ pub trait Bindable {
 impl Bindable for bool {
     fn format_code(&self) -> FormatCode {
         FormatCode::Binary
+    }
+    fn encoded_len(&self) -> usize {
+        5
     }
     fn encode(&self, buf: &mut dyn BufMut) {
         buf.put_i32(1);
@@ -354,6 +400,9 @@ impl Bindable for i16 {
     fn format_code(&self) -> FormatCode {
         FormatCode::Binary
     }
+    fn encoded_len(&self) -> usize {
+        6
+    }
     fn encode(&self, buf: &mut dyn BufMut) {
         buf.put_i32(2);
         buf.put_i16(*self);
@@ -363,6 +412,9 @@ impl Bindable for i16 {
 impl Bindable for i32 {
     fn format_code(&self) -> FormatCode {
         FormatCode::Binary
+    }
+    fn encoded_len(&self) -> usize {
+        8
     }
     fn encode(&self, buf: &mut dyn BufMut) {
         buf.put_i32(4);
@@ -374,6 +426,9 @@ impl Bindable for i64 {
     fn format_code(&self) -> FormatCode {
         FormatCode::Binary
     }
+    fn encoded_len(&self) -> usize {
+        12
+    }
     fn encode(&self, buf: &mut dyn BufMut) {
         buf.put_i32(8);
         buf.put_i64(*self);
@@ -383,6 +438,9 @@ impl Bindable for i64 {
 impl Bindable for f32 {
     fn format_code(&self) -> FormatCode {
         FormatCode::Binary
+    }
+    fn encoded_len(&self) -> usize {
+        8
     }
     fn encode(&self, buf: &mut dyn BufMut) {
         buf.put_i32(4);
@@ -394,6 +452,9 @@ impl Bindable for f64 {
     fn format_code(&self) -> FormatCode {
         FormatCode::Binary
     }
+    fn encoded_len(&self) -> usize {
+        12
+    }
     fn encode(&self, buf: &mut dyn BufMut) {
         buf.put_i32(8);
         buf.put_f64(*self);
@@ -403,6 +464,9 @@ impl Bindable for f64 {
 impl Bindable for str {
     fn format_code(&self) -> FormatCode {
         FormatCode::Text
+    }
+    fn encoded_len(&self) -> usize {
+        4 + self.len()
     }
     fn encode(&self, buf: &mut dyn BufMut) {
         buf.put_i32(self.len() as i32);
@@ -414,6 +478,9 @@ impl Bindable for &str {
     fn format_code(&self) -> FormatCode {
         FormatCode::Text
     }
+    fn encoded_len(&self) -> usize {
+        4 + self.len()
+    }
     fn encode(&self, buf: &mut dyn BufMut) {
         buf.put_i32(self.len() as i32);
         buf.put_slice(self.as_bytes());
@@ -423,6 +490,9 @@ impl Bindable for &str {
 impl Bindable for String {
     fn format_code(&self) -> FormatCode {
         FormatCode::Text
+    }
+    fn encoded_len(&self) -> usize {
+        4 + self.len()
     }
     fn encode(&self, buf: &mut dyn BufMut) {
         buf.put_i32(self.len() as i32);
@@ -434,6 +504,9 @@ impl Bindable for [u8] {
     fn format_code(&self) -> FormatCode {
         FormatCode::Binary
     }
+    fn encoded_len(&self) -> usize {
+        4 + self.len()
+    }
     fn encode(&self, buf: &mut dyn BufMut) {
         buf.put_i32(self.len() as i32);
         buf.put_slice(self);
@@ -444,6 +517,9 @@ impl Bindable for &[u8] {
     fn format_code(&self) -> FormatCode {
         FormatCode::Binary
     }
+    fn encoded_len(&self) -> usize {
+        4 + self.len()
+    }
     fn encode(&self, buf: &mut dyn BufMut) {
         buf.put_i32(self.len() as i32);
         buf.put_slice(self);
@@ -453,6 +529,9 @@ impl Bindable for &[u8] {
 impl Bindable for bytes::Bytes {
     fn format_code(&self) -> FormatCode {
         FormatCode::Binary
+    }
+    fn encoded_len(&self) -> usize {
+        4 + self.len()
     }
     fn encode(&self, buf: &mut dyn BufMut) {
         buf.put_i32(self.len() as i32);
@@ -467,11 +546,46 @@ impl<T: Bindable> Bindable for Option<T> {
             None => FormatCode::Binary,
         }
     }
+    fn encoded_len(&self) -> usize {
+        match self {
+            Some(v) => v.encoded_len(),
+            None => 4,
+        }
+    }
     fn encode(&self, buf: &mut dyn BufMut) {
         match self {
             Some(v) => v.encode(buf),
             None => buf.put_i32(-1),
         }
+    }
+}
+
+/// Fallback byte counter used by `Bindable::encoded_len`.
+struct LenCounter {
+    len: usize,
+    scratch: [u8; 64],
+}
+
+impl Default for LenCounter {
+    fn default() -> Self {
+        Self {
+            len: 0,
+            scratch: [0; 64],
+        }
+    }
+}
+
+unsafe impl BufMut for LenCounter {
+    fn remaining_mut(&self) -> usize {
+        usize::MAX - self.len
+    }
+
+    unsafe fn advance_mut(&mut self, cnt: usize) {
+        self.len = self.len.checked_add(cnt).expect("encoded length overflow");
+    }
+
+    fn chunk_mut(&mut self) -> &mut bytes::buf::UninitSlice {
+        bytes::buf::UninitSlice::new(&mut self.scratch)
     }
 }
 
@@ -481,10 +595,8 @@ impl<T: Bindable> Bindable for Option<T> {
 /// - 1 code: all use same format
 /// - N codes: individual formats
 fn write_format_codes(buf: &mut impl BufMut, formats: impl Iterator<Item = FormatCode> + Clone) {
-    let formats_clone = formats.clone();
-    let mut iter = formats_clone.peekable();
-
-    let Some(&first) = iter.peek() else {
+    let mut iter = formats.clone();
+    let Some(first) = iter.next() else {
         buf.put_u16(0);
         return;
     };
@@ -504,6 +616,21 @@ fn write_format_codes(buf: &mut impl BufMut, formats: impl Iterator<Item = Forma
         for f in formats {
             buf.put_u16(f as u16);
         }
+    }
+}
+
+fn format_codes_len(formats: impl Iterator<Item = FormatCode> + Clone) -> usize {
+    let mut iter = formats.clone();
+    let Some(first) = iter.next() else {
+        return 2;
+    };
+
+    if iter.all(|f| f == first) {
+        if first == FormatCode::Text { 2 } else { 4 }
+    } else {
+        let (lower, upper) = formats.size_hint();
+        assert_eq!(Some(lower), upper, "iterator must have exact size");
+        2 + (lower * 2)
     }
 }
 

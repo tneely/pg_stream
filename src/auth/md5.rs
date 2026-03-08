@@ -8,7 +8,7 @@
 use bytes::{BufMut, BytesMut};
 use md5::Context;
 
-use crate::message::MessageCode;
+use crate::message::{MessageCode, codec::frame};
 
 /// Computes the MD5 password hash for Postgres authentication.
 ///
@@ -53,7 +53,8 @@ pub fn md5_password(username: &str, password: &str, salt: &[u8; 4]) -> BytesMut 
     let outer_hex = hex_encode(&outer_hash.0);
 
     let mut msg = BytesMut::new();
-    MessageCode::PASSWORD_MESSAGE.write(&mut msg, |buf| {
+    msg.put_u8(MessageCode::PASSWORD_MESSAGE.as_u8());
+    frame(&mut msg, 4 + outer_hex.len(), |buf| {
         buf.put_slice(b"md5");
         buf.put_slice(outer_hex.as_bytes());
         buf.put_u8(0);

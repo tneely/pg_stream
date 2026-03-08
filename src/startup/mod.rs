@@ -9,7 +9,7 @@ use crate::{
     message::{
         MessageCode,
         backend::{self},
-        codec::frame,
+        codec::{cstring_len, frame},
     },
 };
 
@@ -166,7 +166,15 @@ impl ConnectionBuilder {
 
     fn as_startup_message(&self) -> Bytes {
         let mut buf = BytesMut::new();
-        frame(&mut buf, |buf| {
+        let payload_len = {
+            let mut len = 4 + 1; // protocol version + trailing terminator
+            for (key, val) in &self.options {
+                len += cstring_len(key.as_bytes()) + cstring_len(val.as_bytes());
+            }
+            len
+        };
+
+        frame(&mut buf, payload_len, |buf| {
             buf.put_u32(self.protocol.into());
 
             for (key, val) in &self.options {
@@ -294,10 +302,13 @@ impl ConnectionBuilder {
 
                 let mut scram = ScramClient::new(self.get_user(), pw);
                 let client_first = scram.client_first();
+                let mech = mech.to_string();
 
                 let mut msg = BytesMut::new();
-                MessageCode::SASL_RESPONSE.write(&mut msg, |buf| {
-                    buf.put_slice(mech.to_string().as_bytes());
+                let payload_len = cstring_len(mech.as_bytes()) + 4 + client_first.len();
+                msg.put_u8(MessageCode::SASL_RESPONSE.as_u8());
+                frame(&mut msg, payload_len, |buf| {
+                    buf.put_slice(mech.as_bytes());
                     buf.put_u8(0);
                     buf.put_u32(client_first.len() as u32);
                     buf.put_slice(client_first.as_bytes());
@@ -315,7 +326,8 @@ impl ConnectionBuilder {
                     .map_err(|e| format!("scram handshake failed: {e}"))?;
 
                 let mut msg = BytesMut::new();
-                MessageCode::SASL_RESPONSE.write(&mut msg, |buf| {
+                msg.put_u8(MessageCode::SASL_RESPONSE.as_u8());
+                frame(&mut msg, client_final.len(), |buf| {
                     buf.put_slice(client_final.as_bytes());
                 });
                 stream.write_all(&msg).await?;
