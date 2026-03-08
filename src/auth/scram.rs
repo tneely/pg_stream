@@ -17,12 +17,8 @@
 //!   |<-- server-final: v=verifier -----------|
 //! ```
 
+use aws_lc_rs::{digest, hmac, pbkdf2, rand};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-use hmac::{Hmac, Mac};
-use rand::RngCore;
-use sha2::{Digest, Sha256};
-
-type HmacSha256 = Hmac<Sha256>;
 
 /// Errors that can occur during SCRAM authentication.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -247,7 +243,7 @@ impl ScramClient {
 /// Generates a random nonce for SCRAM authentication.
 fn generate_nonce() -> String {
     let mut bytes = [0u8; 18];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::fill(&mut bytes).expect("random generation failed");
     BASE64.encode(bytes)
 }
 
@@ -302,22 +298,27 @@ fn parse_server_final(msg: &str) -> Result<String, ScramError> {
 /// Computes PBKDF2-HMAC-SHA256.
 fn pbkdf2_sha256(password: &[u8], salt: &[u8], iterations: u32) -> [u8; 32] {
     let mut result = [0u8; 32];
-    pbkdf2::pbkdf2_hmac::<Sha256>(password, salt, iterations, &mut result);
+    pbkdf2::derive(
+        pbkdf2::PBKDF2_HMAC_SHA256,
+        iterations.try_into().expect("iteration count too large"),
+        salt,
+        password,
+        &mut result,
+    );
     result
 }
 
 /// Computes HMAC-SHA256.
 fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
-    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key size");
-    mac.update(data);
-    mac.finalize().into_bytes().into()
+    let hmac_key = hmac::Key::new(hmac::HMAC_SHA256, key);
+    let tag = hmac::sign(&hmac_key, data);
+    tag.as_ref().try_into().expect("HMAC-SHA256 is 32 bytes")
 }
 
 /// Computes SHA256.
 fn sha256(data: &[u8]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    hasher.finalize().into()
+    let digest = digest::digest(&digest::SHA256, data);
+    digest.as_ref().try_into().expect("SHA256 is 32 bytes")
 }
 
 /// XORs two byte arrays.

@@ -21,15 +21,11 @@ bytes = "1.11"
 tokio = { version = "1.49", optional = true, default-features = false, features = ["io-util"] }
 
 # Crypto dependencies for authentication
+aws-lc-rs = "1"
 base64 = "0.22"
-hmac = "0.12"
-md5 = "0.7"
-pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
-rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
-sha2 = "0.10"
+md5 = "0.7"  # Required for legacy MD5 auth (not in aws-lc-rs)
 
 [dev-dependencies]
-aws-lc-rs = "1"
 base64 = "0"
 criterion = "0"
 ctor = "0"
