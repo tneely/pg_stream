@@ -4,7 +4,7 @@ use bytes::BytesMut;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 
 use pg_stream::{
-    FrontendMessage,
+    PgProtocol,
     message::{Bindable, FormatCode, oid, read_message},
 };
 

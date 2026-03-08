@@ -21,7 +21,7 @@ pub struct Ready;
 ///
 /// ```
 /// use bytes::BytesMut;
-/// use pg_stream::message::FrontendMessage;
+/// use pg_stream::message::PgProtocol;
 /// use pg_stream::message::oid;
 ///
 /// let mut buf = BytesMut::new();
@@ -94,7 +94,7 @@ impl<'a, B: BufMut> ParseBuilder<'a, B, Ready> {
 ///
 /// ```
 /// use bytes::BytesMut;
-/// use pg_stream::message::{FrontendMessage, FormatCode, Bindable};
+/// use pg_stream::message::{PgProtocol, FormatCode, Bindable};
 ///
 /// let mut buf = BytesMut::new();
 /// buf.bind(Some("portal1"))
@@ -180,7 +180,7 @@ impl<'a, B: BufMut> BindBuilder<'a, B> {
 ///
 /// ```
 /// use bytes::BytesMut;
-/// use pg_stream::message::{FrontendMessage, FormatCode, Bindable};
+/// use pg_stream::message::{PgProtocol, FormatCode, Bindable};
 ///
 /// let mut buf = BytesMut::new();
 /// buf.fn_call(1344)

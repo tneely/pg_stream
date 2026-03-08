@@ -28,13 +28,13 @@ use crate::pg_frame;
 ///
 /// ```
 /// use bytes::BytesMut;
-/// use pg_stream::message::FrontendMessage;
+/// use pg_stream::message::PgProtocol;
 ///
 /// let mut buf = BytesMut::new();
 /// buf.query("SELECT 1")
 ///    .sync();
 /// ```
-pub trait FrontendMessage: BufMut + Sized {
+pub trait PgProtocol: BufMut + Sized {
     /// Write a simple Query message.
     fn query(&mut self, stmt: &str) -> &mut Self {
         pg_frame!(self, MessageCode::QUERY, cstring(stmt));
@@ -168,7 +168,7 @@ pub trait FrontendMessage: BufMut + Sized {
     }
 }
 
-impl<B: BufMut> FrontendMessage for B {}
+impl<B: BufMut> PgProtocol for B {}
 
 #[cfg(test)]
 mod tests {

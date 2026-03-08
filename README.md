@@ -19,7 +19,7 @@ A low-level, zero-overhead Rust implementation of the Postgres wire protocol.
 
 ```rust
 use pg_stream::startup::{ConnectionBuilder, AuthenticationMode};
-use pg_stream::FrontendMessage;
+use pg_stream::PgProtocol;
 use pg_stream::messages::backend;
 
 #[tokio::main]
@@ -36,7 +36,7 @@ async fn main() -> pg_stream::startup::Result<()> {
         startup.parameters.get("server_version").unwrap());
 
     // Execute a simple query
-    conn.buf().query("SELECT version()");
+    conn.query("SELECT version()");
     conn.flush().await?;
 
     // Read response
@@ -64,24 +64,20 @@ Supported authentication modes:
 The crate provides full support for the extended query protocol with prepared statements:
 
 ```rust
-use pg_stream::FrontendMessage;
+use pg_stream::PgProtocol;
 use pg_stream::message::oid;
 
 // Parse a prepared statement
-conn.buf()
-    .parse(Some("my_stmt"))
+conn.parse(Some("my_stmt"))
     .query("SELECT $1::int + $2::int")
     .param_types(&[oid::INT4, oid::INT4])
     .finish();
 conn.flush().await?;
 
 // Bind parameters and execute
-conn.buf()
-    .bind("my_stmt")
-    .param(5i32)
-    .param(10i32)
-    .finish()
-    .execute("", 0)
+conn.bind(Some("my_stmt"))
+    .finish(&[&5i32 as &dyn Bindable, &10i32 as &dyn Bindable])
+    .execute(None, 0)
     .sync();
 conn.flush().await?;
 ```
@@ -91,15 +87,13 @@ conn.flush().await?;
 Call Postgres functions directly via the protocol:
 
 ```rust
-use pg_stream::FrontendMessage;
+use pg_stream::PgProtocol;
 use pg_stream::message::FormatCode;
 
 // Call sqrt function (OID 1344)
-conn.buf()
-    .fn_call(1344)
-    .arg("9")
+conn.fn_call(1344)
     .result_format(FormatCode::Text)
-    .finish();
+    .finish(&[&"9" as &dyn Bindable]);
 conn.flush().await?;
 ```
 
@@ -135,7 +129,7 @@ let (conn, startup) = ConnectionBuilder::new("postgres")
 
 ## Protocol Messages
 
-The `FrontendMessage` trait provides methods for all major frontend protocol messages:
+The `PgProtocol` trait provides methods for all major frontend protocol messages:
 
 - **Simple Query** - `query()`
 - **Parse** - `parse()` builder for prepared statements

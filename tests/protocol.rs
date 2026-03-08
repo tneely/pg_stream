@@ -1,7 +1,7 @@
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
 use pg_stream::{
-    FrontendMessage, PgConnection, PgMessage,
+    PgProtocol, PgConnection, PgMessage,
     message::{Bindable, FormatCode, TransactionStatus, oid},
     startup::{AuthenticationMode, ConnectionBuilder, StartupResponse},
 };
@@ -34,7 +34,7 @@ async fn run_pg() -> &'static PostgreSQL {
             pg.start().await?;
 
             let (mut conn, _) = connect_pg(&pg).await;
-            conn.buf().query(
+            conn.query(
                 "
                 CREATE ROLE pw_user WITH LOGIN PASSWORD 'pw';
                 CREATE ROLE md5_user WITH LOGIN PASSWORD 'md5';
@@ -208,8 +208,7 @@ async fn test_pg_extended_protocol() {
     //
     // 1. Parse a named statement
     //
-    conn.buf()
-        .parse(Some("stmt1"))
+    conn.parse(Some("stmt1"))
         .query("SELECT $1 + 1")
         .param_types(&[oid::INT4])
         .finish()
@@ -223,8 +222,7 @@ async fn test_pg_extended_protocol() {
     //
     // 2. Bind to create a named portal
     //
-    conn.buf()
-        .bind(Some("portal1"))
+    conn.bind(Some("portal1"))
         .statement("stmt1")
         .finish(&[&2i32 as &dyn Bindable])
         .flush_msg();
@@ -237,7 +235,7 @@ async fn test_pg_extended_protocol() {
     //
     // 3. Describe the portal
     //
-    conn.buf().describe_portal(Some("portal1")).flush_msg();
+    conn.describe_portal(Some("portal1")).flush_msg();
     conn.flush().await.unwrap();
 
     // Expect RowDescription
@@ -252,7 +250,7 @@ async fn test_pg_extended_protocol() {
     //
     // 4. Execute the portal
     //
-    conn.buf().execute(Some("portal1"), 0).flush_msg();
+    conn.execute(Some("portal1"), 0).flush_msg();
     conn.flush().await.unwrap();
 
     // Expect DataRow + CommandComplete
@@ -272,8 +270,7 @@ async fn test_pg_extended_protocol() {
     //
     // 5. Close both portal and statement
     //
-    conn.buf()
-        .close_portal(Some("portal1"))
+    conn.close_portal(Some("portal1"))
         .close_statement(Some("stmt1"))
         .flush_msg();
     conn.flush().await.unwrap();
@@ -288,7 +285,7 @@ async fn test_pg_extended_protocol() {
     //
     // 6. Sync (end of extended protocol)
     //
-    conn.buf().sync();
+    conn.sync();
     conn.flush().await.unwrap();
 
     let msg = conn.recv().await.unwrap();
@@ -303,7 +300,7 @@ async fn test_put_query_select_1() {
     let pg = run_pg().await;
     let (mut conn, _) = connect_pg(&pg).await;
 
-    conn.buf().query("SELECT 1").flush_msg();
+    conn.query("SELECT 1").flush_msg();
     conn.flush().await.unwrap();
 
     let msg = conn.recv().await.unwrap();
@@ -335,8 +332,7 @@ async fn test_put_fn_call_sqrt() {
 
     // Call built-in function 1344 = sqrt(float8)
     // This may change depending on the version (SELECT oid FROM pg_proc WHERE proname = 'sqrt';)
-    conn.buf()
-        .fn_call(1344)
+    conn.fn_call(1344)
         .result_format(FormatCode::Text)
         .finish(&[&"9" as &dyn Bindable]);
     conn.flush().await.unwrap();
@@ -358,7 +354,7 @@ async fn test_parse_error_response() {
     let pg = run_pg().await;
     let (mut conn, _) = connect_pg(&pg).await;
 
-    conn.buf().query("SELECT * FROM fake_table");
+    conn.query("SELECT * FROM fake_table");
     conn.flush().await.unwrap();
 
     let msg = conn.recv().await.unwrap();

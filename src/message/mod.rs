@@ -2,7 +2,7 @@
 //!
 //! This module provides:
 //!
-//! - [`FrontendMessage`] - Extension trait for writing frontend messages to any buffer
+//! - [`PgProtocol`] - Extension trait for writing frontend messages to any buffer
 //! - [`backend`] - Backend message parsing and types
 //! - [`frontend`] - Frontend message encoding and types
 //!
@@ -10,7 +10,7 @@
 //!
 //! ```
 //! use bytes::BytesMut;
-//! use pg_stream::message::{FrontendMessage, Bindable};
+//! use pg_stream::message::{PgProtocol, Bindable};
 //!
 //! let mut buf = BytesMut::new();
 //!
@@ -32,6 +32,6 @@ pub(crate) mod frontend;
 
 pub use backend::{PgMessage, TransactionStatus, read_message};
 pub use frontend::{
-    BindBuilder, Bindable, FnCallBuilder, FormatCode, FrontendMessage, NeedsQuery, Oid,
+    BindBuilder, Bindable, FnCallBuilder, FormatCode, PgProtocol, NeedsQuery, Oid,
     ParseBuilder, Ready, oid,
 };

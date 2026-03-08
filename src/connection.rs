@@ -9,14 +9,13 @@
 //! # #[cfg(feature = "async")]
 //! # async fn example() -> std::io::Result<()> {
 //! use pg_stream::connection::PgConnection;
-//! use pg_stream::message::FrontendMessage;
+//! use pg_stream::message::PgProtocol;
 //!
 //! let stream = tokio::net::TcpStream::connect("localhost:5432").await?;
 //! let mut conn = PgConnection::new(stream);
 //!
-//! // Build messages using the FrontendMessage trait
-//! conn.buf()
-//!     .query("SELECT 1")
+//! // Build messages using the PgProtocol trait directly on the connection
+//! conn.query("SELECT 1")
 //!     .sync();
 //!
 //! // Send buffered messages
@@ -35,14 +34,13 @@
 //! # fn example() -> std::io::Result<()> {
 //! use std::net::TcpStream;
 //! use pg_stream::connection::PgConnection;
-//! use pg_stream::message::FrontendMessage;
+//! use pg_stream::message::PgProtocol;
 //!
 //! let stream = TcpStream::connect("localhost:5432")?;
 //! let mut conn = PgConnection::new(stream);
 //!
-//! // Build messages using the FrontendMessage trait
-//! conn.buf()
-//!     .query("SELECT 1")
+//! // Build messages using the PgProtocol trait directly on the connection
+//! conn.query("SELECT 1")
 //!     .sync();
 //!
 //! // Send buffered messages
@@ -54,7 +52,7 @@
 //! # }
 //! ```
 
-use bytes::{Bytes, BytesMut};
+use bytes::{buf::UninitSlice, BufMut, Bytes, BytesMut};
 
 #[cfg(feature = "async")]
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -66,12 +64,17 @@ use crate::message::backend::{self, PgMessage};
 
 /// A Postgres connection wrapping a stream with buffered message building.
 ///
-/// `PgConnection` provides:
-/// - A write buffer accessible via [`buf()`](Self::buf) for building messages
-/// - Async methods for flushing messages and receiving frames
+/// `PgConnection` implements [`BufMut`] and [`PgProtocol`](crate::message::PgProtocol),
+/// so protocol messages can be written directly on the connection:
 ///
-/// Messages are built using the [`FrontendMessage`](crate::message::FrontendMessage)
-/// extension trait on the buffer returned by `buf()`.
+/// ```
+/// # use pg_stream::connection::PgConnection;
+/// # use pg_stream::message::PgProtocol;
+/// # let stream: Vec<u8> = vec![];
+/// # let mut conn = PgConnection::new(stream);
+/// conn.query("SELECT 1")
+///     .sync();
+/// ```
 pub struct PgConnection<S> {
     stream: S,
     buf: BytesMut,
@@ -92,27 +95,6 @@ impl<S> PgConnection<S> {
             stream,
             buf: BytesMut::with_capacity(capacity),
         }
-    }
-
-    /// Returns a mutable reference to the write buffer.
-    ///
-    /// Use the [`FrontendMessage`](crate::message::FrontendMessage) trait
-    /// to write protocol messages to this buffer.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// # use bytes::BytesMut;
-    /// # use pg_stream::connection::PgConnection;
-    /// # use pg_stream::message::FrontendMessage;
-    /// # let stream: Vec<u8> = vec![];
-    /// # let mut conn = PgConnection::new(stream);
-    /// conn.buf()
-    ///     .query("SELECT 1")
-    ///     .sync();
-    /// ```
-    pub fn buf(&mut self) -> &mut BytesMut {
-        &mut self.buf
     }
 
     /// Take the buffered bytes, leaving an empty buffer.
@@ -145,6 +127,22 @@ impl<S> PgConnection<S> {
     /// Get a mutable reference to the underlying stream.
     pub fn stream_mut(&mut self) -> &mut S {
         &mut self.stream
+    }
+}
+
+// Implement BufMut to enable PgProtocol trait methods directly on PgConnection
+unsafe impl<S> BufMut for PgConnection<S> {
+    fn remaining_mut(&self) -> usize {
+        self.buf.remaining_mut()
+    }
+
+    unsafe fn advance_mut(&mut self, cnt: usize) {
+        // SAFETY: caller guarantees cnt bytes have been initialized
+        unsafe { self.buf.advance_mut(cnt) }
+    }
+
+    fn chunk_mut(&mut self) -> &mut UninitSlice {
+        self.buf.chunk_mut()
     }
 }
 
@@ -219,14 +217,14 @@ impl<S: Read> PgConnection<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::FrontendMessage;
+    use crate::message::PgProtocol;
 
     #[test]
-    fn test_buf_access() {
+    fn test_frontend_message_methods() {
         let stream: Vec<u8> = vec![];
         let mut conn = PgConnection::new(stream);
 
-        conn.buf().query("SELECT 1");
+        conn.query("SELECT 1");
 
         assert!(conn.has_pending());
         assert!(conn.pending_len() > 0);
@@ -237,7 +235,7 @@ mod tests {
         let stream: Vec<u8> = vec![];
         let mut conn = PgConnection::new(stream);
 
-        conn.buf().sync();
+        conn.sync();
         let bytes = conn.take_buf();
 
         assert!(!bytes.is_empty());
@@ -249,11 +247,39 @@ mod tests {
         let stream: Vec<u8> = vec![];
         let mut conn = PgConnection::new(stream);
 
-        conn.buf().query("test");
+        conn.query("test");
         let (stream, buf) = conn.into_parts();
 
         assert!(stream.is_empty());
         assert!(!buf.is_empty());
+    }
+
+    #[test]
+    fn test_chaining() {
+        let stream: Vec<u8> = vec![];
+        let mut conn = PgConnection::new(stream);
+
+        // Test that chaining works directly on PgConnection
+        conn.query("SELECT 1")
+            .sync()
+            .terminate();
+
+        assert!(conn.pending_len() > 0);
+    }
+
+    #[test]
+    fn test_builder_chaining() {
+        let stream: Vec<u8> = vec![];
+        let mut conn = PgConnection::new(stream);
+
+        // Test that builders return &mut PgConnection for chaining
+        conn.parse(None)
+            .query("SELECT $1")
+            .finish()
+            .execute(None, 0)
+            .sync();
+
+        assert!(conn.pending_len() > 0);
     }
 
     #[cfg(feature = "async")]
@@ -265,7 +291,7 @@ mod tests {
             let mut output = Vec::new();
             let mut conn = PgConnection::new(&mut output);
 
-            conn.buf().sync();
+            conn.sync();
             conn.flush().await.unwrap();
 
             // Sync message: 'S' + length(4)
@@ -295,7 +321,7 @@ mod tests {
             let mut output = Vec::new();
             let mut conn = PgConnection::new(&mut output);
 
-            conn.buf().sync();
+            conn.sync();
             conn.flush_sync().unwrap();
 
             // Sync message: 'S' + length(4)

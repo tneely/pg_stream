@@ -10,14 +10,14 @@
 //!
 //! - **Connection establishment** via [`ConnectionBuilder`] with support for
 //!   authentication and TLS
-//! - **Message construction** using the [`FrontendMessage`] extension trait on any buffer
+//! - **Message construction** using the [`PgProtocol`] extension trait on any buffer
 //! - **Frame reading** from backend responses via [`PgConnection`]
 //!
 //! # Example: Simple Query
 //!
 //! ```no_run
 //! use pg_stream::startup::{ConnectionBuilder, AuthenticationMode};
-//! use pg_stream::FrontendMessage;
+//! use pg_stream::PgProtocol;
 //!
 //! # #[tokio::main]
 //! # async fn main() -> pg_stream::startup::Result<()> {
@@ -30,8 +30,7 @@
 //!     .await?;
 //!
 //! // Execute a query
-//! conn.buf()
-//!     .query("SELECT 1");
+//! conn.query("SELECT 1");
 //! conn.flush().await?;
 //!
 //! // Read responses
@@ -47,20 +46,18 @@
 //! # Example: Prepared Statements
 //!
 //! ```no_run
-//! # use pg_stream::{startup::ConnectionBuilder, PgConnection, FrontendMessage};
+//! # use pg_stream::{startup::ConnectionBuilder, PgConnection, PgProtocol};
 //! # use pg_stream::message::{Bindable, oid};
 //! # async fn example(mut conn: PgConnection<tokio::net::TcpStream>) -> std::io::Result<()> {
 //! // Parse a prepared statement
-//! conn.buf()
-//!     .parse(Some("stmt"))
+//! conn.parse(Some("stmt"))
 //!     .query("SELECT $1::int")
 //!     .param_types(&[oid::INT4])
 //!     .finish();
 //! conn.flush().await?;
 //!
 //! // Bind and execute
-//! conn.buf()
-//!     .bind(Some("stmt"))
+//! conn.bind(Some("stmt"))
 //!     .finish(&[&42i32 as &dyn Bindable])
 //!     .execute(None, 0)
 //!     .sync();
@@ -71,14 +68,14 @@
 //!
 //! # Protocol Messages
 //!
-//! The [`FrontendMessage`] trait provides methods for constructing all major
+//! The [`PgProtocol`] trait provides methods for constructing all major
 //! frontend protocol messages on any buffer implementing [`BufMut`](bytes::BufMut):
 //!
-//! - **Query execution**: [`query`](FrontendMessage::query), [`execute`](FrontendMessage::execute)
-//! - **Prepared statements**: [`parse`](FrontendMessage::parse), [`bind`](FrontendMessage::bind)
-//! - **Metadata**: [`describe_statement`](FrontendMessage::describe_statement), [`describe_portal`](FrontendMessage::describe_portal)
-//! - **Resource management**: [`close_statement`](FrontendMessage::close_statement), [`close_portal`](FrontendMessage::close_portal)
-//! - **Flow control**: [`flush_msg`](FrontendMessage::flush_msg), [`sync`](FrontendMessage::sync)
+//! - **Query execution**: [`query`](PgProtocol::query), [`execute`](PgProtocol::execute)
+//! - **Prepared statements**: [`parse`](PgProtocol::parse), [`bind`](PgProtocol::bind)
+//! - **Metadata**: [`describe_statement`](PgProtocol::describe_statement), [`describe_portal`](PgProtocol::describe_portal)
+//! - **Resource management**: [`close_statement`](PgProtocol::close_statement), [`close_portal`](PgProtocol::close_portal)
+//! - **Flow control**: [`flush_msg`](PgProtocol::flush_msg), [`sync`](PgProtocol::sync)
 //!
 //! # Authentication
 //!
@@ -118,5 +115,5 @@ pub mod connection;
 pub mod message;
 
 pub use connection::PgConnection;
-pub use message::FrontendMessage;
+pub use message::PgProtocol;
 pub use message::backend::{ErrorResponse, PgMessage};
