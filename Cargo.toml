@@ -1,6 +1,6 @@
 [package]
 name = "pg_stream"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 authors = ["Taylor Neely <tneely417@gmail.com>"]
 description = "A low-level, zero-overhead Rust implementation of the Postgres wire protocol."

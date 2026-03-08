@@ -124,6 +124,30 @@ pub trait FrontendMessage: BufMut + Sized {
         self
     }
 
+    /// Write a CopyData message.
+    ///
+    /// Used during COPY operations to send data to the server.
+    fn copy_data(&mut self, data: &[u8]) -> &mut Self {
+        pg_frame!(self, MessageCode::COPY_DATA, bytes(data));
+        self
+    }
+
+    /// Write a CopyDone message.
+    ///
+    /// Signals successful completion of a COPY operation.
+    fn copy_done(&mut self) -> &mut Self {
+        pg_frame!(self, MessageCode::COPY_DONE);
+        self
+    }
+
+    /// Write a CopyFail message.
+    ///
+    /// Signals that the COPY operation should be aborted with an error message.
+    fn copy_fail(&mut self, msg: &str) -> &mut Self {
+        pg_frame!(self, MessageCode::COPY_FAIL, cstring(msg));
+        self
+    }
+
     /// Start building a Parse message.
     ///
     /// Specify `None` to prepare an unnamed statement.
@@ -269,5 +293,37 @@ mod tests {
         let none: Option<i32> = None;
         none.encode(&mut buf);
         assert_eq!(buf, vec![255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn test_copy_data() {
+        let mut buf = BytesMut::new();
+        buf.copy_data(b"hello\tworld\n");
+
+        assert_eq!(buf[0], b'd');
+        let len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]);
+        assert_eq!(len, 4 + 12); // length field + data
+        assert_eq!(&buf[5..], b"hello\tworld\n");
+    }
+
+    #[test]
+    fn test_copy_done() {
+        let mut buf = BytesMut::new();
+        buf.copy_done();
+
+        assert_eq!(buf[0], b'c');
+        assert_eq!(&buf[1..5], &4u32.to_be_bytes());
+        assert_eq!(buf.len(), 5);
+    }
+
+    #[test]
+    fn test_copy_fail() {
+        let mut buf = BytesMut::new();
+        buf.copy_fail("invalid data format");
+
+        assert_eq!(buf[0], b'f');
+        let len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]);
+        assert_eq!(len, 4 + 20); // length field + "invalid data format\0"
+        assert_eq!(&buf[5..], b"invalid data format\0");
     }
 }
