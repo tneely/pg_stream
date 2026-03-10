@@ -14,19 +14,18 @@ categories = ["database"]
 default = ["async", "startup"]
 async = ["dep:tokio"]
 sync = []
-startup = ["async"]
+startup = ["async", "dep:aws-lc-rs", "dep:base64", "dep:md5"]
 
 [dependencies]
 bytes = "1.11"
 tokio = { version = "1.49", optional = true, default-features = false, features = ["io-util"] }
 
 # Crypto dependencies for authentication
-aws-lc-rs = "1"
-base64 = "0.22"
-md5 = "0.7"  # Required for legacy MD5 auth (not in aws-lc-rs)
+aws-lc-rs = { version = "1.16.1", optional = true }
+base64 ={ version = "0.22", optional = true }
+md5 = { version = "0.7", optional = true }
 
 [dev-dependencies]
-base64 = "0"
 criterion = "0"
 ctor = "0"
 postgresql_commands = "0"
