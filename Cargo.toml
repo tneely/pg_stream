@@ -6,7 +6,7 @@ authors = ["Taylor Neely <tneely417@gmail.com>"]
 description = "A low-level, zero-overhead Rust implementation of the Postgres wire protocol."
 repository = "https://github.com/tneely/pg_stream"
 readme = "README.md"
-license-file = "LICENSE"
+license = "MIT"
 keywords = ["postgresql"]
 categories = ["database"]
 
