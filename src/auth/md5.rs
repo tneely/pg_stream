@@ -38,7 +38,7 @@ pub fn md5_password(username: &str, password: &str, salt: &[u8; 4]) -> BytesMut 
     let mut ctx = Context::new();
     ctx.consume(password.as_bytes());
     ctx.consume(username.as_bytes());
-    let inner_hash = ctx.compute();
+    let inner_hash = ctx.finalize();
 
     // Convert to hex string
     let inner_hex = hex_encode(&inner_hash.0);
@@ -47,7 +47,7 @@ pub fn md5_password(username: &str, password: &str, salt: &[u8; 4]) -> BytesMut 
     let mut ctx = Context::new();
     ctx.consume(inner_hex.as_bytes());
     ctx.consume(salt);
-    let outer_hash = ctx.compute();
+    let outer_hash = ctx.finalize();
 
     // Final result: "md5" + hex(outer_hash) + null terminator
     let outer_hex = hex_encode(&outer_hash.0);
