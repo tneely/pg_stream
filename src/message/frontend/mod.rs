@@ -12,6 +12,8 @@ mod types;
 pub use bindable::Bindable;
 pub use builders::{BindBuilder, FnCallBuilder, NeedsQuery, ParseBuilder, Ready};
 pub use code::MessageCode;
+// Low-level framing helpers, used by the startup/auth handshake.
+#[cfg(feature = "startup")]
 pub use codec::{cstring_len, frame};
 pub use types::{FormatCode, Oid, oid};
 
@@ -220,7 +222,7 @@ mod tests {
         let mut buf = BytesMut::new();
         buf.bind(Some("portal1"))
             .statement("stmt1")
-            .finish(&[&42i32 as &dyn Bindable, &"hello" as &dyn Bindable]);
+            .finish(crate::params![42i32, "hello"]);
 
         assert_eq!(buf[0], b'B');
     }
@@ -228,9 +230,37 @@ mod tests {
     #[test]
     fn test_bind_no_params() {
         let mut buf = BytesMut::new();
-        buf.bind(Some("portal1")).statement("stmt1").finish(&[]);
+        buf.bind(Some("portal1"))
+            .statement("stmt1")
+            .finish(crate::params![]);
 
         assert_eq!(buf[0], b'B');
+    }
+
+    #[test]
+    fn test_params_macro_matches_explicit_dyn() {
+        let vec_data: Vec<u8> = vec![1, 2, 3];
+        let owned = String::from("owned");
+
+        let mut with_macro = BytesMut::new();
+        with_macro.bind(None).finish(crate::params![
+            42i32,
+            "hello",
+            &owned,
+            &vec_data,
+            Option::<i64>::None
+        ]);
+
+        let mut with_dyn = BytesMut::new();
+        with_dyn.bind(None).finish(&[
+            &42i32 as &dyn Bindable,
+            &"hello" as &dyn Bindable,
+            &owned as &dyn Bindable,
+            &vec_data as &dyn Bindable,
+            &None::<i64> as &dyn Bindable,
+        ]);
+
+        assert_eq!(with_macro, with_dyn);
     }
 
     #[test]
@@ -238,7 +268,7 @@ mod tests {
         let mut buf = BytesMut::new();
         buf.fn_call(1234)
             .result_format(FormatCode::Binary)
-            .finish(&[&"test" as &dyn Bindable, &42i32 as &dyn Bindable]);
+            .finish(crate::params!["test", 42i32]);
 
         assert_eq!(buf[0], b'F');
     }
@@ -250,7 +280,7 @@ mod tests {
             .query("SELECT $1")
             .finish()
             .bind(Some("s"))
-            .finish(&[&1i32 as &dyn Bindable])
+            .finish(crate::params![1i32])
             .execute(None, 0)
             .sync();
 

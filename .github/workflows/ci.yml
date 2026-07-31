@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    name: Test & lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (all features)
+        run: cargo clippy --all-features --all-targets
+
+      - name: Unit tests (all features)
+        run: cargo test --lib --all-features
+
+      - name: Doc tests
+        run: cargo test --doc --all-features
+
+  feature-matrix:
+    name: Build feature combinations
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        features:
+          - async
+          - sync
+          - async,sync
+          - async,startup
+          - async,sync,startup
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build (${{ matrix.features }})
+        run: cargo build --no-default-features --features "${{ matrix.features }}"
+
+  live:
+    name: Live integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Per-user pg_hba rules must precede any catch-all (first match wins); the
+      # final reject stops anything silently falling back to trust.
+      - name: Set up Postgres with per-method auth and TLS
+        run: |
+          PGBIN=$(pg_config --bindir)
+          PGDATA=$RUNNER_TEMP/pgdata
+          export LC_ALL=C
+          "$PGBIN/initdb" -D "$PGDATA" -U postgres --auth=trust -E UTF8
+          openssl req -new -x509 -days 1 -nodes -text \
+            -subj "/CN=localhost" \
+            -out "$PGDATA/server.crt" -keyout "$PGDATA/server.key"
+          chmod 600 "$PGDATA/server.key"
+          {
+            echo "port = 54329"
+            echo "listen_addresses = 'localhost'"
+            echo "ssl = on"
+          } >> "$PGDATA/postgresql.conf"
+          cat > "$PGDATA/pg_hba.conf" <<'HBA'
+          local   all       all                              trust
+          hostssl all       sha_user   127.0.0.1/32          scram-sha-256
+          host    all       sha_user   127.0.0.1/32          scram-sha-256
+          host    all       md5_user   127.0.0.1/32          md5
+          host    all       pw_user    127.0.0.1/32          password
+          host    all       postgres   127.0.0.1/32          trust
+          host    all       all        127.0.0.1/32          reject
+          HBA
+          "$PGBIN/pg_ctl" -D "$PGDATA" -l "$PGDATA/server.log" -w start
+          psql -h /tmp -p 54329 -U postgres -v ON_ERROR_STOP=1 <<'SQL'
+          SET password_encryption = 'md5';
+          CREATE ROLE md5_user WITH LOGIN PASSWORD 'md5';
+          SET password_encryption = 'scram-sha-256';
+          CREATE ROLE sha_user WITH LOGIN PASSWORD 'sha';
+          CREATE ROLE pw_user WITH LOGIN PASSWORD 'pw';
+          SQL
+
+      - name: Run live tests
+        env:
+          PGSTREAM_TEST_PORT: 54329
+          PGSTREAM_TEST_TLS: "1"
+        run: cargo test --test live --all-features

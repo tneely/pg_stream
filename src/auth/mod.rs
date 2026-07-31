@@ -28,4 +28,6 @@ mod scram;
 
 pub use cleartext::cleartext_password;
 pub use md5::md5_password;
-pub use scram::{ScramClient, ScramError};
+pub use scram::{
+    ChannelBinding, MAX_SCRAM_ITERATIONS, ScramClient, ScramError, tls_server_end_point,
+};

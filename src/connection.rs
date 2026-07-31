@@ -54,13 +54,16 @@
 
 use bytes::{BufMut, Bytes, BytesMut, buf::UninitSlice};
 
+#[cfg(feature = "sync")]
+use bytes::Buf;
+
 #[cfg(feature = "async")]
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 #[cfg(feature = "sync")]
 use std::io::{Read, Write};
 
-use crate::message::backend::{self, PgMessage};
+use crate::message::backend::{MessageLimits, MessageReader, PgMessage};
 
 /// A Postgres connection wrapping a stream with buffered message building.
 ///
@@ -77,7 +80,10 @@ use crate::message::backend::{self, PgMessage};
 /// ```
 pub struct PgConnection<S> {
     stream: S,
+    /// Outgoing write buffer for frontend messages.
     buf: BytesMut,
+    /// Incoming read buffer / framer for backend messages.
+    reader: MessageReader,
 }
 
 impl<S> PgConnection<S> {
@@ -86,37 +92,75 @@ impl<S> PgConnection<S> {
         Self {
             stream,
             buf: BytesMut::with_capacity(4096),
+            reader: MessageReader::new(),
         }
     }
 
-    /// Create a new connection with a specified buffer capacity.
+    /// Create a new connection with a specified write-buffer capacity.
     pub fn with_capacity(stream: S, capacity: usize) -> Self {
         Self {
             stream,
             buf: BytesMut::with_capacity(capacity),
+            reader: MessageReader::new(),
         }
     }
 
-    /// Take the buffered bytes, leaving an empty buffer.
+    /// Create a connection with custom backend-message size limits.
+    pub fn with_message_limits(stream: S, limits: MessageLimits) -> Self {
+        Self {
+            stream,
+            buf: BytesMut::with_capacity(4096),
+            reader: MessageReader::with_limits(limits),
+        }
+    }
+
+    /// Create a connection seeded with bytes already read from the stream, so
+    /// the startup handshake can hand off anything buffered past `ReadyForQuery`.
+    pub fn with_read_buffer(stream: S, prebuffered: BytesMut) -> Self {
+        Self::with_read_buffer_and_limits(stream, prebuffered, MessageLimits::default())
+    }
+
+    /// Create a connection with custom limits and bytes already read from the
+    /// stream.
+    pub fn with_read_buffer_and_limits(
+        stream: S,
+        prebuffered: BytesMut,
+        limits: MessageLimits,
+    ) -> Self {
+        Self {
+            stream,
+            buf: BytesMut::with_capacity(4096),
+            reader: MessageReader::from_buffer_with_limits(prebuffered, limits),
+        }
+    }
+
+    /// Take the buffered outgoing bytes, leaving an empty buffer.
     ///
     /// This is useful for manually sending the bytes or inspecting them.
     pub fn take_buf(&mut self) -> Bytes {
         self.buf.split().freeze()
     }
 
-    /// Returns true if there are buffered bytes waiting to be sent.
+    /// Returns true if there are outgoing bytes waiting to be sent.
     pub fn has_pending(&self) -> bool {
         !self.buf.is_empty()
     }
 
-    /// Returns the number of buffered bytes.
+    /// Returns the number of buffered outgoing bytes.
     pub fn pending_len(&self) -> usize {
         self.buf.len()
     }
 
-    /// Consume the connection and return the underlying stream and buffer.
-    pub fn into_parts(self) -> (S, BytesMut) {
-        (self.stream, self.buf)
+    /// Returns `true` if a complete backend message is already buffered and can
+    /// be returned by `recv` without reading from the stream.
+    pub fn has_buffered_message(&self) -> bool {
+        self.reader.has_message()
+    }
+
+    /// Consume the connection and return the underlying stream, the pending
+    /// outgoing bytes, and any buffered incoming bytes.
+    pub fn into_parts(self) -> (S, BytesMut, BytesMut) {
+        (self.stream, self.buf, self.reader.into_buffer())
     }
 
     /// Get a reference to the underlying stream.
@@ -124,9 +168,21 @@ impl<S> PgConnection<S> {
         &self.stream
     }
 
-    /// Get a mutable reference to the underlying stream.
-    pub fn stream_mut(&mut self) -> &mut S {
-        &mut self.stream
+    /// Get a mutable reference to the underlying stream when doing so cannot
+    /// bypass buffered protocol data.
+    ///
+    /// Returns [`WouldBlock`](std::io::ErrorKind::WouldBlock) while outgoing
+    /// bytes are pending or incoming bytes have been prefetched. Flush or
+    /// receive that data first, or use [`into_parts`](Self::into_parts) to take
+    /// explicit ownership of all three parts.
+    pub fn stream_mut(&mut self) -> std::io::Result<&mut S> {
+        if !self.buf.is_empty() || !self.reader.buffered().is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "direct stream access would bypass buffered protocol data",
+            ));
+        }
+        Ok(&mut self.stream)
     }
 }
 
@@ -155,28 +211,29 @@ impl<S: AsyncWrite + Unpin> PgConnection<S> {
     /// flushes the stream.
     pub async fn flush(&mut self) -> std::io::Result<()> {
         if !self.buf.is_empty() {
-            self.stream.write_all(&self.buf).await?;
-            self.buf.clear();
+            self.stream.write_all_buf(&mut self.buf).await?;
         }
         self.stream.flush().await
     }
 
-    /// Write raw bytes to the stream without buffering.
+    /// Write raw bytes after any messages already buffered on the connection.
     ///
-    /// This is useful for sending pre-built messages or SSL requests.
+    /// The bytes join the normal outgoing queue before it is flushed, so a
+    /// partial write or cancellation leaves only the unsent suffix pending.
+    /// Resume a cancelled call with [`flush`](Self::flush), rather than calling
+    /// `write_raw` with the same bytes again.
     pub async fn write_raw(&mut self, bytes: &[u8]) -> std::io::Result<()> {
-        self.stream.write_all(bytes).await
+        self.buf.extend_from_slice(bytes);
+        self.flush().await
     }
 }
 
 #[cfg(feature = "async")]
 impl<S: AsyncRead + Unpin> PgConnection<S> {
-    /// Read a single message from the stream.
-    ///
-    /// This reads and parses one Postgres protocol message from the
-    /// underlying stream.
+    /// Read a single backend message. Reads are buffered internally, so one
+    /// syscall may satisfy several `recv` calls and bodies are sliced zero-copy.
     pub async fn recv(&mut self) -> std::io::Result<PgMessage> {
-        backend::read_message(&mut self.stream).await
+        self.reader.read_message(&mut self.stream).await
     }
 }
 
@@ -188,29 +245,36 @@ impl<S: Write> PgConnection<S> {
     /// This writes all pending bytes to the underlying stream and
     /// flushes the stream.
     pub fn flush_sync(&mut self) -> std::io::Result<()> {
-        if !self.buf.is_empty() {
-            self.stream.write_all(&self.buf)?;
-            self.buf.clear();
+        while !self.buf.is_empty() {
+            match self.stream.write(&self.buf) {
+                Ok(0) => {
+                    return Err(std::io::Error::from(std::io::ErrorKind::WriteZero));
+                }
+                Ok(written) => self.buf.advance(written),
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(err) => return Err(err),
+            }
         }
         self.stream.flush()
     }
 
-    /// Write raw bytes to the stream without buffering (synchronous version).
+    /// Write raw bytes after any messages already buffered on the connection.
     ///
-    /// This is useful for sending pre-built messages or SSL requests.
+    /// A partial-write error leaves only the unsent suffix in the connection;
+    /// call [`flush_sync`](Self::flush_sync) to resume it.
     pub fn write_raw_sync(&mut self, bytes: &[u8]) -> std::io::Result<()> {
-        self.stream.write_all(bytes)
+        self.buf.extend_from_slice(bytes);
+        self.flush_sync()
     }
 }
 
 #[cfg(feature = "sync")]
 impl<S: Read> PgConnection<S> {
-    /// Read a single message from the stream (synchronous version).
+    /// Read a single backend message from the stream (synchronous version).
     ///
-    /// This reads and parses one Postgres protocol message from the
-    /// underlying stream.
+    /// Reads are buffered internally like the async [`recv`](Self::recv).
     pub fn recv_sync(&mut self) -> std::io::Result<PgMessage> {
-        backend::read_message_sync(&mut self.stream)
+        self.reader.read_message_sync(&mut self.stream)
     }
 }
 
@@ -248,10 +312,11 @@ mod tests {
         let mut conn = PgConnection::new(stream);
 
         conn.query("test");
-        let (stream, buf) = conn.into_parts();
+        let (stream, buf, read_buf) = conn.into_parts();
 
         assert!(stream.is_empty());
         assert!(!buf.is_empty());
+        assert!(read_buf.is_empty());
     }
 
     #[test]
@@ -280,9 +345,118 @@ mod tests {
         assert!(conn.pending_len() > 0);
     }
 
+    #[test]
+    fn test_stream_mut_requires_empty_protocol_buffers() {
+        let mut conn = PgConnection::new(Vec::<u8>::new());
+        conn.sync();
+        assert_eq!(
+            conn.stream_mut().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+
+        let _ = conn.take_buf();
+        assert!(conn.stream_mut().is_ok());
+
+        let mut conn =
+            PgConnection::with_read_buffer(Vec::<u8>::new(), BytesMut::from(&b"prefetched"[..]));
+        assert_eq!(
+            conn.stream_mut().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
     #[cfg(feature = "async")]
     mod async_tests {
+        use std::{
+            future::{Future, poll_fn},
+            pin::Pin,
+            sync::{
+                Arc,
+                atomic::{AtomicBool, Ordering},
+            },
+            task::{Context, Poll},
+        };
+
+        use tokio::io::AsyncWrite;
+
         use super::*;
+
+        struct PendingAfterFirstWrite {
+            output: Vec<u8>,
+            blocked: Arc<AtomicBool>,
+            wrote_once: bool,
+        }
+
+        impl AsyncWrite for PendingAfterFirstWrite {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                bytes: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                if self.wrote_once && self.blocked.load(Ordering::Relaxed) {
+                    return Poll::Pending;
+                }
+
+                let written = bytes.len().min(2);
+                self.output.extend_from_slice(&bytes[..written]);
+                self.wrote_once = true;
+                Poll::Ready(Ok(written))
+            }
+
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        struct ErrorAfterFirstWrite {
+            output: Vec<u8>,
+            writes: usize,
+        }
+
+        impl AsyncWrite for ErrorAfterFirstWrite {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                bytes: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                self.writes += 1;
+                if self.writes == 2 {
+                    return Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)));
+                }
+
+                let written = if self.writes == 1 {
+                    bytes.len().min(2)
+                } else {
+                    bytes.len()
+                };
+                self.output.extend_from_slice(&bytes[..written]);
+                Poll::Ready(Ok(written))
+            }
+
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
 
         #[tokio::test]
         async fn test_flush() {
@@ -298,6 +472,64 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn flush_preserves_progress_across_cancellation() {
+            let blocked = Arc::new(AtomicBool::new(true));
+            let writer = PendingAfterFirstWrite {
+                output: Vec::new(),
+                blocked: blocked.clone(),
+                wrote_once: false,
+            };
+            let mut conn = PgConnection::new(writer);
+            conn.sync();
+
+            let mut flush = Box::pin(conn.flush());
+            poll_fn(|cx| {
+                assert!(flush.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            drop(flush);
+
+            assert_eq!(conn.pending_len(), 3);
+            blocked.store(false, Ordering::Relaxed);
+            conn.flush().await.unwrap();
+
+            let (writer, pending, _) = conn.into_parts();
+            assert!(pending.is_empty());
+            assert_eq!(writer.output, [b'S', 0, 0, 0, 4]);
+        }
+
+        #[tokio::test]
+        async fn flush_preserves_progress_across_write_error() {
+            let writer = ErrorAfterFirstWrite {
+                output: Vec::new(),
+                writes: 0,
+            };
+            let mut conn = PgConnection::new(writer);
+            conn.sync();
+
+            let err = conn.flush().await.unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+            assert_eq!(conn.pending_len(), 3);
+
+            conn.flush().await.unwrap();
+            let (writer, pending, _) = conn.into_parts();
+            assert!(pending.is_empty());
+            assert_eq!(writer.output, [b'S', 0, 0, 0, 4]);
+        }
+
+        #[tokio::test]
+        async fn write_raw_follows_buffered_messages() {
+            let mut conn = PgConnection::new(Vec::<u8>::new());
+            conn.sync();
+            conn.write_raw(b"raw").await.unwrap();
+
+            let (output, pending, _) = conn.into_parts();
+            assert!(pending.is_empty());
+            assert_eq!(output, [b'S', 0, 0, 0, 4, b'r', b'a', b'w']);
+        }
+
+        #[tokio::test]
         async fn test_recv() {
             // Create a buffer with a valid message: ReadyForQuery 'Z' + len=5 + 'I'
             let input: &[u8] = &[b'Z', 0, 0, 0, 5, b'I'];
@@ -307,12 +539,57 @@ mod tests {
 
             assert!(matches!(msg, PgMessage::ReadyForQuery(_)));
         }
+
+        #[tokio::test]
+        async fn test_with_read_buffer_serves_prebuffered_then_stream() {
+            // Startup handed off one complete ParseComplete plus the first two
+            // bytes of a ReadyForQuery; the rest arrives from the stream.
+            let prebuffered = BytesMut::from(&[b'1', 0, 0, 0, 4, b'Z', 0][..]);
+            let stream: &[u8] = &[0, 0, 5, b'I'];
+            let mut conn = PgConnection::with_read_buffer(stream, prebuffered);
+
+            assert!(conn.has_buffered_message());
+            assert!(matches!(
+                conn.recv().await.unwrap(),
+                PgMessage::ParseComplete
+            ));
+            assert!(matches!(
+                conn.recv().await.unwrap(),
+                PgMessage::ReadyForQuery(_)
+            ));
+        }
     }
 
     #[cfg(feature = "sync")]
     mod sync_tests {
         use super::*;
-        use std::io::Cursor;
+        use std::io::{Cursor, Write};
+
+        struct ErrorAfterFirstWrite {
+            output: Vec<u8>,
+            writes: usize,
+        }
+
+        impl Write for ErrorAfterFirstWrite {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.writes += 1;
+                if self.writes == 2 {
+                    return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+                }
+
+                let written = if self.writes == 1 {
+                    bytes.len().min(2)
+                } else {
+                    bytes.len()
+                };
+                self.output.extend_from_slice(&bytes[..written]);
+                Ok(written)
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
 
         #[test]
         fn test_flush_sync() {
@@ -325,6 +602,36 @@ mod tests {
             // Sync message: 'S' + length(4)
             assert_eq!(output.len(), 5);
             assert_eq!(output[0], b'S');
+        }
+
+        #[test]
+        fn flush_sync_preserves_progress_across_write_error() {
+            let writer = ErrorAfterFirstWrite {
+                output: Vec::new(),
+                writes: 0,
+            };
+            let mut conn = PgConnection::new(writer);
+            conn.sync();
+
+            let err = conn.flush_sync().unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+            assert_eq!(conn.pending_len(), 3);
+
+            conn.flush_sync().unwrap();
+            let (writer, pending, _) = conn.into_parts();
+            assert!(pending.is_empty());
+            assert_eq!(writer.output, [b'S', 0, 0, 0, 4]);
+        }
+
+        #[test]
+        fn write_raw_sync_follows_buffered_messages() {
+            let mut conn = PgConnection::new(Vec::<u8>::new());
+            conn.sync();
+            conn.write_raw_sync(b"raw").unwrap();
+
+            let (output, pending, _) = conn.into_parts();
+            assert!(pending.is_empty());
+            assert_eq!(output, [b'S', 0, 0, 0, 4, b'r', b'a', b'w']);
         }
 
         #[test]

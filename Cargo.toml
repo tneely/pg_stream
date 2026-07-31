@@ -1,9 +1,9 @@
 [package]
 name = "pg_stream"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 authors = ["Taylor Neely <tneely417@gmail.com>"]
-description = "A low-level, zero-overhead Rust implementation of the Postgres wire protocol."
+description = "A low-level, high-performance Rust implementation of the Postgres wire protocol."
 repository = "https://github.com/tneely/pg_stream"
 readme = "README.md"
 license = "MIT"
@@ -18,7 +18,7 @@ startup = ["async", "dep:aws-lc-rs", "dep:base64", "dep:md5"]
 
 [dependencies]
 bytes = "1.11"
-tokio = { version = "1.52", optional = true, default-features = false, features = ["io-util"] }
+tokio = { version = "1.52", optional = true, default-features = false, features = ["io-util", "rt"] }
 
 # Crypto dependencies for authentication
 aws-lc-rs = { version = "1.16.3", optional = true }
@@ -27,12 +27,7 @@ md5 = { version = "0.8", optional = true }
 
 [dev-dependencies]
 criterion = "0"
-ctor = "0"
-postgresql_commands = "0"
-postgresql_embedded = { version = "0", features = ["tokio", "rustls"] }
-tempfile = "3"
-rustls = { version = "0", features = ["aws-lc-rs"] }
-tokio = "1"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread"] }
 tokio-rustls ={ version = "0", features = ["aws-lc-rs"] }
 
 [[bench]]

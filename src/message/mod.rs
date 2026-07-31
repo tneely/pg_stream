@@ -10,7 +10,7 @@
 //!
 //! ```
 //! use bytes::BytesMut;
-//! use pg_stream::message::{PgProtocol, Bindable};
+//! use pg_stream::{message::PgProtocol, params};
 //!
 //! let mut buf = BytesMut::new();
 //!
@@ -22,7 +22,7 @@
 //!    .query("SELECT $1::int")
 //!    .finish()
 //!    .bind(Some("stmt"))
-//!    .finish(&[&42i32 as &dyn Bindable])
+//!    .finish(params![42i32])
 //!    .execute(None, 0)
 //!    .sync();
 //! ```
@@ -30,8 +30,17 @@
 pub(crate) mod backend;
 pub(crate) mod frontend;
 
-pub use backend::{PgMessage, TransactionStatus, read_message};
+pub use backend::{
+    Authentication, BackendKeyData, CommandComplete, CopyResponse, DataRow, DataRowIter,
+    ErrorResponse, FunctionCallResponse, MessageLimits, MessageReader, NegotiateProtocolVersion,
+    NoticeResponse, NotificationResponse, ParameterDescription, ParameterStatus, PgMessage,
+    ReadyForQuery, RowDescription, TransactionStatus,
+};
 pub use frontend::{
     BindBuilder, Bindable, FnCallBuilder, FormatCode, NeedsQuery, Oid, ParseBuilder, PgProtocol,
     Ready, oid,
 };
+
+// `params!` is `#[macro_export]` (crate root); also expose it here so
+// `message::params` resolves alongside the other message items.
+pub use crate::params;

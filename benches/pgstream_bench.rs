@@ -5,7 +5,8 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 
 use pg_stream::{
     PgProtocol,
-    message::{Bindable, FormatCode, oid, read_message},
+    message::{FormatCode, MessageReader, PgMessage, oid},
+    params,
 };
 
 fn bench_put_query(c: &mut Criterion) {
@@ -99,7 +100,7 @@ fn bench_put_bind(c: &mut Criterion) {
             buf.bind(None)
                 .statement(black_box(""))
                 .result_format(FormatCode::Text)
-                .finish(&[&"42" as &dyn Bindable]);
+                .finish(params!["42"]);
         });
     });
 
@@ -110,11 +111,7 @@ fn bench_put_bind(c: &mut Criterion) {
             buf.bind(Some(black_box("portal1")))
                 .statement(black_box("stmt1"))
                 .result_format(FormatCode::Binary)
-                .finish(&[
-                    &"42" as &dyn Bindable,
-                    &"John Doe" as &dyn Bindable,
-                    &binary_data as &dyn Bindable,
-                ]);
+                .finish(params!["42", "John Doe", binary_data]);
         });
     });
 
@@ -126,15 +123,15 @@ fn bench_put_bind(c: &mut Criterion) {
             let mut buf = BytesMut::with_capacity(256);
             buf.bind(Some(black_box("portal2")))
                 .statement(black_box("stmt2"))
-                .finish(&[
-                    &"1" as &dyn Bindable,
-                    &"2" as &dyn Bindable,
-                    &binary1 as &dyn Bindable,
-                    &"test" as &dyn Bindable,
-                    &binary2 as &dyn Bindable,
-                    &"more data" as &dyn Bindable,
-                    &none as &dyn Bindable,
-                    &"final" as &dyn Bindable,
+                .finish(params![
+                    "1",
+                    "2",
+                    binary1,
+                    "test",
+                    binary2,
+                    "more data",
+                    none,
+                    "final"
                 ]);
         });
     });
@@ -190,7 +187,7 @@ fn bench_put_fn_call(c: &mut Criterion) {
             let mut buf = BytesMut::with_capacity(64);
             buf.fn_call(black_box(12345))
                 .result_format(FormatCode::Text)
-                .finish(&[&"arg1" as &dyn Bindable]);
+                .finish(params!["arg1"]);
         });
     });
 
@@ -200,11 +197,7 @@ fn bench_put_fn_call(c: &mut Criterion) {
             let mut buf = BytesMut::with_capacity(64);
             buf.fn_call(black_box(67890))
                 .result_format(FormatCode::Binary)
-                .finish(&[
-                    &"arg1" as &dyn Bindable,
-                    &binary_data as &dyn Bindable,
-                    &"arg3" as &dyn Bindable,
-                ]);
+                .finish(params!["arg1", binary_data, "arg3"]);
         });
     });
 
@@ -221,7 +214,7 @@ fn bench_chained_operations(c: &mut Criterion) {
                 .query(black_box("SELECT $1"))
                 .finish()
                 .bind(Some(black_box("stmt")))
-                .finish(&[&"42" as &dyn Bindable])
+                .finish(params!["42"])
                 .execute(None, black_box(0))
                 .sync();
         });
@@ -241,7 +234,7 @@ fn bench_chained_operations(c: &mut Criterion) {
                 .bind(Some(black_box("my_portal")))
                 .statement(black_box("complex_stmt"))
                 .result_format(FormatCode::Binary)
-                .finish(&[&"value1" as &dyn Bindable, &binary_data as &dyn Bindable])
+                .finish(params!["value1", binary_data])
                 .describe_portal(Some(black_box("my_portal")))
                 .execute(Some(black_box("my_portal")), black_box(50))
                 .close_portal(Some(black_box("my_portal")))
@@ -264,22 +257,29 @@ fn bench_read_message(c: &mut Criterion) {
         buf
     }
 
-    let ready_for_query = create_frame(b'Z', &[b'I']);
+    async fn read_one(reader: &mut MessageReader, frame: &[u8]) -> PgMessage {
+        let mut stream = frame;
+        reader.read_message(&mut stream).await.unwrap()
+    }
+
+    let ready_for_query = create_frame(b'Z', b"I");
     group.bench_function("ready_for_query_idle", |b| {
+        let mut reader = MessageReader::new();
         b.iter(|| {
             rt.block_on(async {
                 let stream = black_box(ready_for_query.as_slice());
-                read_message(stream).await.unwrap()
+                read_one(&mut reader, stream).await
             })
         })
     });
 
     let command_complete = create_frame(b'C', b"SELECT 1\0");
     group.bench_function("command_complete_select", |b| {
+        let mut reader = MessageReader::new();
         b.iter(|| {
             rt.block_on(async {
                 let stream = black_box(command_complete.as_slice());
-                read_message(stream).await.unwrap()
+                read_one(&mut reader, stream).await
             })
         })
     });
@@ -291,23 +291,25 @@ fn bench_read_message(c: &mut Criterion) {
     parameter_status_body.push(0);
     let parameter_status = create_frame(b'S', &parameter_status_body);
     group.bench_function("parameter_status", |b| {
+        let mut reader = MessageReader::new();
         b.iter(|| {
             rt.block_on(async {
                 let stream = black_box(parameter_status.as_slice());
-                read_message(stream).await.unwrap()
+                read_one(&mut reader, stream).await
             })
         })
     });
 
     let mut backend_key_data_body = Vec::new();
     backend_key_data_body.extend_from_slice(&12345_u32.to_be_bytes());
-    backend_key_data_body.extend_from_slice(&67890_u32.to_be_bytes());
+    backend_key_data_body.extend_from_slice(&[0xAB; 32]); // 3.2-length secret key
     let backend_key_data = create_frame(b'K', &backend_key_data_body);
     group.bench_function("backend_key_data", |b| {
+        let mut reader = MessageReader::new();
         b.iter(|| {
             rt.block_on(async {
                 let stream = black_box(backend_key_data.as_slice());
-                read_message(stream).await.unwrap()
+                read_one(&mut reader, stream).await
             })
         })
     });
@@ -324,10 +326,11 @@ fn bench_read_message(c: &mut Criterion) {
     row_description_body.extend_from_slice(&0_u16.to_be_bytes());
     let row_description = create_frame(b'T', &row_description_body);
     group.bench_function("row_description_single_column", |b| {
+        let mut reader = MessageReader::new();
         b.iter(|| {
             rt.block_on(async {
                 let stream = black_box(row_description.as_slice());
-                read_message(stream).await.unwrap()
+                read_one(&mut reader, stream).await
             })
         })
     });
@@ -339,10 +342,11 @@ fn bench_read_message(c: &mut Criterion) {
     data_row_body.extend_from_slice(&(-1_i32).to_be_bytes());
     let data_row = create_frame(b'D', &data_row_body);
     group.bench_function("data_row_two_columns", |b| {
+        let mut reader = MessageReader::new();
         b.iter(|| {
             rt.block_on(async {
                 let stream = black_box(data_row.as_slice());
-                read_message(stream).await.unwrap()
+                read_one(&mut reader, stream).await
             })
         })
     });
@@ -355,35 +359,147 @@ fn bench_read_message(c: &mut Criterion) {
     error_response_body.push(0);
     let error_response = create_frame(b'E', &error_response_body);
     group.bench_function("error_response", |b| {
+        let mut reader = MessageReader::new();
         b.iter(|| {
             rt.block_on(async {
                 let stream = black_box(error_response.as_slice());
-                read_message(stream).await.unwrap()
+                read_one(&mut reader, stream).await
             })
         })
     });
 
     let copy_data_1kb = create_frame(b'd', &vec![b'x'; 1024]);
     group.bench_function("copy_data_1kb", |b| {
+        let mut reader = MessageReader::new();
         b.iter(|| {
             rt.block_on(async {
                 let stream = black_box(copy_data_1kb.as_slice());
-                read_message(stream).await.unwrap()
+                read_one(&mut reader, stream).await
             })
         })
     });
 
     let copy_data_100kb = create_frame(b'd', &vec![b'x'; 100 * 1024]);
     group.bench_function("copy_data_100kb", |b| {
+        let mut reader = MessageReader::new();
         b.iter(|| {
             rt.block_on(async {
                 let stream = black_box(copy_data_100kb.as_slice());
-                read_message(stream).await.unwrap()
+                read_one(&mut reader, stream).await
             })
         })
     });
 
     group.finish();
+}
+
+/// Measures framing a stream of small messages with one persistent reader.
+fn bench_stream_reader(c: &mut Criterion) {
+    let mut group = c.benchmark_group("stream_reader");
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    fn create_frame(code: u8, body: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.push(code);
+        buf.extend_from_slice(&((body.len() + 4) as u32).to_be_bytes());
+        buf.extend_from_slice(body);
+        buf
+    }
+
+    // A typical result stream: RowDescription, many DataRows, CommandComplete,
+    // ReadyForQuery, all delivered in one buffer.
+    let mut stream_bytes = Vec::new();
+    stream_bytes.extend_from_slice(&create_frame(b'T', &[0; 32]));
+    for _ in 0..100 {
+        stream_bytes.extend_from_slice(&create_frame(b'D', &[0, 1, 0, 0, 0, 2, b'4', b'2']));
+    }
+    stream_bytes.extend_from_slice(&create_frame(b'C', b"SELECT 100\0"));
+    stream_bytes.extend_from_slice(&create_frame(b'Z', b"I"));
+    let message_count = 103;
+
+    group.bench_function("buffered_reader_103_messages", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let mut stream = black_box(stream_bytes.as_slice());
+                let mut reader = MessageReader::new();
+                for _ in 0..message_count {
+                    black_box(reader.read_message(&mut stream).await.unwrap());
+                }
+            })
+        })
+    });
+
+    group.finish();
+}
+
+fn bench_stream_reader_sync(c: &mut Criterion) {
+    #[cfg(feature = "sync")]
+    {
+        use std::io::Read;
+
+        let mut group = c.benchmark_group("stream_reader_sync");
+
+        fn create_frame(code: u8, body: &[u8]) -> Vec<u8> {
+            let mut buf = Vec::new();
+            buf.push(code);
+            buf.extend_from_slice(&((body.len() + 4) as u32).to_be_bytes());
+            buf.extend_from_slice(body);
+            buf
+        }
+
+        let mut stream_bytes = Vec::new();
+        stream_bytes.extend_from_slice(&create_frame(b'T', &[0; 32]));
+        for _ in 0..100 {
+            stream_bytes.extend_from_slice(&create_frame(b'D', &[0, 1, 0, 0, 0, 2, b'4', b'2']));
+        }
+        stream_bytes.extend_from_slice(&create_frame(b'C', b"SELECT 100\0"));
+        stream_bytes.extend_from_slice(&create_frame(b'Z', b"I"));
+
+        struct ChunkedRead<'a> {
+            bytes: &'a [u8],
+            position: usize,
+            chunk_size: usize,
+        }
+
+        impl Read for ChunkedRead<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let remaining = &self.bytes[self.position..];
+                let read = remaining.len().min(buf.len()).min(self.chunk_size);
+                buf[..read].copy_from_slice(&remaining[..read]);
+                self.position += read;
+                Ok(read)
+            }
+        }
+
+        group.bench_function("buffered_reader_103_messages", |b| {
+            b.iter(|| {
+                let mut stream = black_box(stream_bytes.as_slice());
+                let mut reader = MessageReader::new();
+                for _ in 0..103 {
+                    black_box(reader.read_message_sync(&mut stream).unwrap());
+                }
+            })
+        });
+
+        group.bench_function("64_byte_reads_103_messages", |b| {
+            b.iter(|| {
+                let mut stream = ChunkedRead {
+                    bytes: black_box(&stream_bytes),
+                    position: 0,
+                    chunk_size: 64,
+                };
+                let mut reader = MessageReader::new();
+                for _ in 0..103 {
+                    black_box(reader.read_message_sync(&mut stream).unwrap());
+                }
+            })
+        });
+
+        group.finish();
+    }
+
+    #[cfg(not(feature = "sync"))]
+    let _ = c;
 }
 
 criterion_group!(
@@ -396,5 +512,7 @@ criterion_group!(
     bench_put_fn_call,
     bench_chained_operations,
     bench_read_message,
+    bench_stream_reader,
+    bench_stream_reader_sync,
 );
 criterion_main!(benches);

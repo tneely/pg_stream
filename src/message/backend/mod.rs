@@ -9,12 +9,10 @@ mod parse;
 mod wrappers;
 
 pub use code::MessageCode;
-#[cfg(feature = "async")]
-pub use io::read_message;
-#[cfg(feature = "sync")]
-pub use io::read_message_sync;
+pub use io::{MessageLimits, MessageReader};
 pub use wrappers::{
-    BackendKeyData, CommandComplete, CopyResponse, DataRow, ErrorResponse, NoticeResponse,
+    Authentication, BackendKeyData, CommandComplete, CopyResponse, DataRow, DataRowIter,
+    ErrorResponse, FunctionCallResponse, NegotiateProtocolVersion, NoticeResponse,
     NotificationResponse, ParameterDescription, ParameterStatus, ReadyForQuery, RowDescription,
     TransactionStatus,
 };
@@ -33,9 +31,10 @@ pub enum PgMessage {
     CommandComplete(CommandComplete),
     EmptyQueryResponse,
 
-    // Errors and notices
-    ErrorResponse(ErrorResponse),
-    NoticeResponse(NoticeResponse),
+    // Errors and notices. Boxed: inline, their field ranges would dominate
+    // `size_of::<PgMessage>()` for every message the reader returns.
+    ErrorResponse(Box<ErrorResponse>),
+    NoticeResponse(Box<NoticeResponse>),
 
     // Connection state
     ReadyForQuery(ReadyForQuery),
@@ -60,12 +59,12 @@ pub enum PgMessage {
     CopyOutResponse(CopyResponse),
     CopyBothResponse(CopyResponse),
 
-    // Authentication (body preserved for caller to interpret)
-    Authentication(Bytes),
+    // Authentication
+    Authentication(Authentication),
 
     // Misc
-    FunctionCallResponse(Bytes),
-    NegotiateProtocolVersion(Bytes),
+    FunctionCallResponse(FunctionCallResponse),
+    NegotiateProtocolVersion(NegotiateProtocolVersion),
 
     /// An unrecognized message code. The raw code and body are preserved.
     Unknown {

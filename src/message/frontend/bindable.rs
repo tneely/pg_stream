@@ -4,6 +4,18 @@ use bytes::BufMut;
 
 use super::types::FormatCode;
 
+/// Builds a `&[&dyn Bindable]` parameter list without per-value casts, e.g.
+/// `params![42i32, "hi", Option::<i64>::None]` or `params![]` for none.
+#[macro_export]
+macro_rules! params {
+    () => {
+        &[] as &[&dyn $crate::message::Bindable]
+    };
+    ($($val:expr),+ $(,)?) => {
+        &[$(&$val as &dyn $crate::message::Bindable),+] as &[&dyn $crate::message::Bindable]
+    };
+}
+
 /// Trait for types that can be bound as Postgres parameters.
 pub trait Bindable {
     /// Returns the format code for this parameter type.
@@ -113,19 +125,6 @@ impl Bindable for str {
     }
 }
 
-impl Bindable for &str {
-    fn format_code(&self) -> FormatCode {
-        FormatCode::Text
-    }
-    fn encoded_len(&self) -> usize {
-        4 + self.len()
-    }
-    fn encode(&self, buf: &mut dyn BufMut) {
-        buf.put_i32(self.len() as i32);
-        buf.put_slice(self.as_bytes());
-    }
-}
-
 impl Bindable for String {
     fn format_code(&self) -> FormatCode {
         FormatCode::Text
@@ -152,7 +151,7 @@ impl Bindable for [u8] {
     }
 }
 
-impl Bindable for &[u8] {
+impl Bindable for Vec<u8> {
     fn format_code(&self) -> FormatCode {
         FormatCode::Binary
     }
@@ -196,6 +195,18 @@ impl<T: Bindable> Bindable for Option<T> {
             Some(v) => v.encode(buf),
             None => buf.put_i32(-1),
         }
+    }
+}
+
+impl<T: Bindable + ?Sized> Bindable for &T {
+    fn format_code(&self) -> FormatCode {
+        (**self).format_code()
+    }
+    fn encoded_len(&self) -> usize {
+        (**self).encoded_len()
+    }
+    fn encode(&self, buf: &mut dyn BufMut) {
+        (**self).encode(buf)
     }
 }
 

@@ -94,13 +94,13 @@ impl<'a, B: BufMut> ParseBuilder<'a, B, Ready> {
 ///
 /// ```
 /// use bytes::BytesMut;
-/// use pg_stream::message::{PgProtocol, FormatCode, Bindable};
+/// use pg_stream::{message::{PgProtocol, FormatCode}, params};
 ///
 /// let mut buf = BytesMut::new();
 /// buf.bind(Some("portal1"))
 ///    .statement("stmt1")
 ///    .result_format(FormatCode::Binary)
-///    .finish(&[&42i32 as &dyn Bindable, &"hello" as &dyn Bindable]);
+///    .finish(params![42i32, "hello"]);
 /// ```
 pub struct BindBuilder<'a, B: BufMut> {
     buf: &'a mut B,
@@ -180,12 +180,12 @@ impl<'a, B: BufMut> BindBuilder<'a, B> {
 ///
 /// ```
 /// use bytes::BytesMut;
-/// use pg_stream::message::{PgProtocol, FormatCode, Bindable};
+/// use pg_stream::{message::{PgProtocol, FormatCode}, params};
 ///
 /// let mut buf = BytesMut::new();
 /// buf.fn_call(1344)
 ///    .result_format(FormatCode::Text)
-///    .finish(&[&"9" as &dyn Bindable]);
+///    .finish(params!["9"]);
 /// ```
 pub struct FnCallBuilder<'a, B: BufMut> {
     buf: &'a mut B,

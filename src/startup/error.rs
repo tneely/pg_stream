@@ -9,6 +9,12 @@ pub enum Error {
     Io(std::io::Error),
     PasswordRequired,
     TlsUnsupported,
+    /// The server required SCRAM channel binding but no TLS certificate was
+    /// available to bind to.
+    ChannelBindingRequired,
+    /// The server requested GSSAPI/SSPI but no provider was supplied (use
+    /// [`ConnectionBuilder::connect_with_gss`](crate::startup::ConnectionBuilder::connect_with_gss)).
+    GssUnavailable,
     Server(Box<ErrorResponse>),
     Unexpected(String),
 }
@@ -19,6 +25,18 @@ impl std::fmt::Display for Error {
             Error::Io(e) => write!(f, "encountered I/O error: {e}"),
             Error::PasswordRequired => write!(f, "password is required"),
             Error::TlsUnsupported => write!(f, "server does not support TLS"),
+            Error::ChannelBindingRequired => {
+                write!(
+                    f,
+                    "server required channel binding but no TLS certificate was available"
+                )
+            }
+            Error::GssUnavailable => {
+                write!(
+                    f,
+                    "server requested GSSAPI/SSPI but no provider was supplied"
+                )
+            }
             Error::Server(e) => {
                 write!(f, "encountered Postgres error response: {e:?}")
             }

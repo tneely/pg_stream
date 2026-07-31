@@ -46,8 +46,8 @@
 //! # Example: Prepared Statements
 //!
 //! ```no_run
-//! # use pg_stream::{startup::ConnectionBuilder, PgConnection, PgProtocol};
-//! # use pg_stream::message::{Bindable, oid};
+//! # use pg_stream::{startup::ConnectionBuilder, PgConnection, PgProtocol, params};
+//! # use pg_stream::message::oid;
 //! # async fn example(mut conn: PgConnection<tokio::net::TcpStream>) -> std::io::Result<()> {
 //! // Parse a prepared statement
 //! conn.parse(Some("stmt"))
@@ -58,7 +58,7 @@
 //!
 //! // Bind and execute
 //! conn.bind(Some("stmt"))
-//!     .finish(&[&42i32 as &dyn Bindable])
+//!     .finish(params![42i32])
 //!     .execute(None, 0)
 //!     .sync();
 //! conn.flush().await?;
@@ -79,15 +79,20 @@
 //!
 //! # Authentication
 //!
-//! Currently supported authentication modes:
+//! Every credential-bearing method a PostgreSQL 18 server can request is
+//! supported:
 //!
-//! - [`AuthenticationMode::Trust`](startup::AuthenticationMode::Trust) - No authentication
-//! - [`AuthenticationMode::Password`](startup::AuthenticationMode::Password) - Cleartext or SCRAM-SHA-256
+//! - [`AuthenticationMode::Trust`](startup::AuthenticationMode::Trust) - trust/peer/ident/cert
+//! - [`AuthenticationMode::Password`](startup::AuthenticationMode::Password) - cleartext, MD5,
+//!   SCRAM-SHA-256, and SCRAM-SHA-256-PLUS (channel binding over TLS)
+//! - [`AuthenticationMode::OAuthBearer`](startup::AuthenticationMode::OAuthBearer) - OAUTHBEARER (PG18+)
+//! - GSSAPI/SSPI via [`ConnectionBuilder::connect_with_gss`](startup::ConnectionBuilder::connect_with_gss)
+//!   and the [`GssProvider`](startup::GssProvider) trait
 //!
 //! # TLS Support
 //!
-//! TLS can be negotiated using [`ConnectionBuilder::connect_with_tls`](startup::ConnectionBuilder::connect_with_tls)
-//! with a custom async upgrade function.
+//! TLS is negotiated with [`ConnectionBuilder::connect_with_tls`](startup::ConnectionBuilder::connect_with_tls).
+//! The upgrade closure may return the server certificate to enable channel binding.
 //!
 //! # Performance Considerations
 //!

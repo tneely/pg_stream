@@ -1,26 +1,29 @@
 # pg_stream
 
-A low-level, zero-overhead Rust implementation of the Postgres wire protocol.
+A low-level, high-performance Rust implementation of the PostgreSQL wire protocol.
 
 ## Overview
 
-`pg_stream` provides direct access to the Postgres frontend/backend protocol, giving you full control over connection management, query execution, and data transfer. Unlike higher-level database libraries, this crate focuses on protocol implementation without abstraction overhead.
+`pg_stream` gives you direct, allocation-conscious access to the Postgres frontend/backend protocol: connection startup, authentication, the simple and extended query protocols, COPY, and function calls. It does not impose a query builder, connection pool, or type-mapping layer, so you keep full control over the byte stream while the crate handles framing, buffering, and message encoding/decoding.
 
 ## Features
 
-- **Zero-copy protocol handling** - Direct buffer manipulation for maximum performance
-- **TLS support** - Built-in SSL/TLS negotiation with custom upgrade functions
-- **Extended query protocol** - Full support for prepared statements, portals, and parameter binding
-- **Function calls** - Direct invocation of Postgres functions via protocol messages
-- **Extension trait API** - Write messages to any buffer implementing `BufMut`
-- **Format optimization** - Automatic optimization of format codes in bind and function call messages
+- **Buffered streaming reads** - a single read can frame many backend messages, and message bodies are sliced zero-copy from the read buffer
+- **Zero-copy message wrappers** - typed accessors over `bytes::Bytes` with no per-field allocation
+- **Ergonomic parameters** - the `params!` macro builds bind/function-call parameter lists without `as &dyn Bindable` casts
+- **Extended query protocol** - prepared statements, portals, parameter binding, and describe
+- **Complete authentication** - trust, cleartext, MD5, SCRAM-SHA-256, SCRAM-SHA-256-PLUS (channel binding), OAUTHBEARER, and GSSAPI/SSPI plumbing
+- **TLS** - SSL negotiation with a caller-supplied async upgrade function
+- **Query cancellation** - build and send a `CancelRequest` on a side connection
+- **Sync and async** - both I/O backends behind feature flags
+- **Extension-trait API** - write frontend messages to any `bytes::BufMut`
 
 ## Quick Start
 
 ```rust
-use pg_stream::startup::{ConnectionBuilder, AuthenticationMode};
-use pg_stream::PgProtocol;
-use pg_stream::messages::backend;
+use pg_stream::{PgMessage, PgProtocol, params};
+use pg_stream::startup::{AuthenticationMode, ConnectionBuilder};
+use pg_stream::message::oid;
 
 #[tokio::main]
 async fn main() -> pg_stream::startup::Result<()> {
@@ -32,19 +35,29 @@ async fn main() -> pg_stream::startup::Result<()> {
         .connect(stream)
         .await?;
 
-    println!("Connected to server version: {}",
-        startup.parameters.get("server_version").unwrap());
+    println!("server version: {}", startup.parameters["server_version"]);
 
-    // Execute a simple query
-    conn.query("SELECT version()");
+    // Extended query protocol with bound parameters.
+    conn.parse(Some("stmt"))
+        .query("SELECT $1::int + $2::int")
+        .param_types(&[oid::INT4, oid::INT4])
+        .finish()
+        .bind(Some("portal"))
+        .statement("stmt")
+        .finish(params![5i32, 10i32])
+        .execute(Some("portal"), 0)
+        .sync();
     conn.flush().await?;
 
-    // Read response
     loop {
-        let frame = conn.recv().await?;
-        // Handle frame...
-        if matches!(frame.code, backend::MessageCode::READY_FOR_QUERY) {
-            break;
+        match conn.recv().await? {
+            PgMessage::DataRow(row) => {
+                for col in &row {
+                    println!("{:?}", col);
+                }
+            }
+            PgMessage::ReadyForQuery(_) => break,
+            _ => {}
         }
     }
 
@@ -52,108 +65,178 @@ async fn main() -> pg_stream::startup::Result<()> {
 }
 ```
 
+## Parameters
+
+Use the `params!` macro to build parameter lists. It accepts any mix of
+[`Bindable`] values without per-value casts, including owned values, references,
+and `Option` for NULL:
+
+```rust
+use pg_stream::{PgProtocol, params};
+use bytes::BytesMut;
+
+let mut buf = BytesMut::new();
+let name = String::from("Ada");
+let blob: Vec<u8> = vec![0xde, 0xad];
+
+buf.bind(None)
+    .finish(params![42i32, &name, blob, Option::<i64>::None]);
+```
+
+`Bindable` is implemented for the integer and float types, `bool`, `str`,
+`String`, `[u8]`, `Vec<u8>`, `bytes::Bytes`, `Option<T>`, and `&T` for any
+bindable `T`. Implement it yourself for custom encodings.
+
+## Reading responses
+
+`conn.recv()` returns a parsed [`PgMessage`]. Reads are buffered internally, so
+one syscall may satisfy several `recv` calls. Row values are exposed zero-copy:
+
+```rust
+# use pg_stream::PgMessage;
+# fn handle(msg: PgMessage) {
+if let PgMessage::DataRow(row) = msg {
+    // Single O(n) pass over the row; `None` for SQL NULL.
+    for value in &row {
+        // value: Option<&[u8]>
+    }
+}
+# }
+```
+
+Backend frames use separate default limits for control messages (1 MiB) and
+bulk payload messages such as rows and COPY data (64 MiB). Fixed-size messages
+are checked against their protocol size, and large bodies grow incrementally.
+Use [`MessageLimits`] when an application needs tighter or larger bounds:
+
+```rust
+use pg_stream::message::MessageLimits;
+use pg_stream::startup::ConnectionBuilder;
+
+# let stream = Vec::<u8>::new();
+let limits = MessageLimits::new(256 * 1024, 16 * 1024 * 1024);
+let builder = ConnectionBuilder::new("postgres").message_limits(limits);
+```
+
 ## Authentication
 
-Supported authentication modes:
+Every credential-bearing method a PostgreSQL 18 server can request over the wire
+is supported:
 
-- `AuthenticationMode::Trust` - No password required
-- `AuthenticationMode::Password(String)` - Cleartext or SCRAM-SHA-256 password authentication
+| Server `pg_hba` method | Handled by |
+| --- | --- |
+| `trust`, `peer`, `ident`, `cert` | `AuthenticationMode::Trust` |
+| `password`, `ldap`, `radius`, `pam`, `bsd` | `AuthenticationMode::Password` (cleartext) |
+| `md5` | `AuthenticationMode::Password` (MD5) |
+| `scram-sha-256` | `AuthenticationMode::Password` (SCRAM-SHA-256) |
+| `scram-sha-256` over TLS | `AuthenticationMode::Password` (SCRAM-SHA-256-PLUS, channel binding) |
+| `oauth` (PostgreSQL 18+) | `AuthenticationMode::OAuthBearer(token)` |
+| `gss`, `sspi` | `ConnectionBuilder::connect_with_gss` |
 
-## Extended Query Protocol
+```rust,no_run
+# use pg_stream::startup::{AuthenticationMode, ConnectionBuilder};
+// Password: the server chooses cleartext / MD5 / SCRAM / SCRAM-PLUS.
+ConnectionBuilder::new("user").auth(AuthenticationMode::Password("secret".into()));
 
-The crate provides full support for the extended query protocol with prepared statements:
-
-```rust
-use pg_stream::PgProtocol;
-use pg_stream::message::oid;
-
-// Parse a prepared statement
-conn.parse(Some("my_stmt"))
-    .query("SELECT $1::int + $2::int")
-    .param_types(&[oid::INT4, oid::INT4])
-    .finish();
-conn.flush().await?;
-
-// Bind parameters and execute
-conn.bind(Some("my_stmt"))
-    .finish(&[&5i32 as &dyn Bindable, &10i32 as &dyn Bindable])
-    .execute(None, 0)
-    .sync();
-conn.flush().await?;
+// OAuth 2.0 bearer token (OAUTHBEARER).
+ConnectionBuilder::new("user").auth(AuthenticationMode::OAuthBearer("ya29...".into()));
 ```
 
-## Function Calls
+Channel binding (`SCRAM-SHA-256-PLUS`) is selected automatically when the
+connection is over TLS and the closure passed to `connect_with_tls` returns the
+server certificate (see below). Over TLS without a certificate, the client sends
+the SCRAM downgrade-detection flag so a stripped-`PLUS` offer is caught.
 
-Call Postgres functions directly via the protocol:
+### GSSAPI / SSPI
 
-```rust
-use pg_stream::PgProtocol;
-use pg_stream::message::FormatCode;
+Token generation requires a platform Kerberos/SSPI library, so `pg_stream` frames
+the exchange and takes tokens from a caller-supplied [`GssProvider`]:
 
-// Call sqrt function (OID 1344)
-conn.fn_call(1344)
-    .result_format(FormatCode::Text)
-    .finish(&[&"9" as &dyn Bindable]);
-conn.flush().await?;
+```rust,ignore
+struct MyGss { /* wraps libgssapi or Windows SSPI */ }
+impl pg_stream::startup::GssProvider for MyGss {
+    type Error = std::io::Error;
+    fn step(&mut self, input: &[u8]) -> Result<Vec<u8>, Self::Error> { /* ... */ }
+}
+
+let (conn, startup) =
+    ConnectionBuilder::new("user").connect_with_gss(stream, &mut MyGss::new()).await?;
 ```
 
-**Note**: Function OIDs are not guaranteed to be stable across Postgres versions or installations. Look them up dynamically via system catalogs for production use.
+## Query cancellation
 
-## TLS Support
+The startup response carries the backend's `process_id` and `secret_key`. To
+cancel an in-progress query, send a `CancelRequest` on a *new* connection:
 
-Connect with TLS using a custom upgrade function:
+```rust,no_run
+# use pg_stream::startup::{StartupResponse, send_cancel_request};
+# async fn cancel(startup: &StartupResponse) -> std::io::Result<()> {
+send_cancel_request(startup.process_id, &startup.secret_key, || async {
+    tokio::net::TcpStream::connect("localhost:5432").await
+})
+.await
+# }
+```
 
-```rust
-let stream = tokio::net::TcpStream::connect("localhost:5432").await.unwrap();
-stream.set_nodelay(true).unwrap();
+`secret_key` is a byte string, not a `u32`: protocol 3.2 (PostgreSQL 18) made
+the cancel key variable-length (4 to 256 bytes, up to 32 from PostgreSQL
+itself). Store and forward it verbatim rather than assuming a width.
 
+Cancellation keys identify the backend session, not an individual query. Keep
+the primary connection quarantined while cancellation is in flight, then drain
+its responses through the cancelled query's `ReadyForQuery` before sending
+another query. Reusing it earlier lets a delayed cancellation request cancel
+the next query on that session.
+
+## TLS
+
+The upgrade closure returns the TLS stream and, optionally, the server
+certificate in DER form. Returning the certificate enables `SCRAM-SHA-256-PLUS`
+channel binding; returning `None` still works but binds nothing.
+
+```rust,ignore
 let (conn, startup) = ConnectionBuilder::new("postgres")
     .connect_with_tls(stream, async |s| {
-        let mut root_cert_store = tokio_rustls::rustls::RootCertStore::empty();
-        let cert_bytes = pem_to_der("/certs/ca.crt").await?;
-        root_cert_store.add(cert_bytes.into()).unwrap();
-
-        let config = tokio_rustls::rustls::ClientConfig::builder()
-            .with_root_certificates(root_cert_store)
-            .with_no_client_auth();
-
-        let connector = TlsConnector::from(Arc::new(config));
-
-        let server_name = "localhost".try_into().unwrap();
-        let stream = connector.connect(server_name, s).await?;
-        Ok(stream)
+        let tls = connector.connect(server_name, s).await?; // e.g. tokio-rustls
+        let cert = tls.get_ref().1.peer_certificates()
+            .and_then(|c| c.first())
+            .map(|c| c.as_ref().to_vec());
+        Ok((tls, cert))
     })
-    .await
-    .unwrap();
+    .await?;
 ```
 
-## Protocol Messages
+## Feature flags
 
-The `PgProtocol` trait provides methods for all major frontend protocol messages:
-
-- **Simple Query** - `query()`
-- **Parse** - `parse()` builder for prepared statements
-- **Bind** - `bind()` builder to bind parameters
-- **Describe** - `describe_statement()`, `describe_portal()`
-- **Execute** - `execute()` to run a portal
-- **Close** - `close_statement()`, `close_portal()`
-- **Flush** - `flush_msg()` to send buffered messages
-- **Sync** - `sync()` to end an extended query sequence
-- **Function Call** - `fn_call()` builder to invoke functions
+- `async` (default) - Tokio-based async I/O
+- `sync` - blocking `std::io` I/O
+- `startup` (default) - connection builder and authentication (implies `async`)
 
 ## Performance
 
-This crate is designed for scenarios where you need maximum control and minimum overhead:
+- One buffered read frames many messages; bodies are zero-copy slices
+- Frontend messages are size-computed and written in a single pass, no scratch buffers
+- Bind and function-call format codes are collapsed to the compact protocol form
+- Minimal dependencies (`bytes`, `tokio` io-util, and crypto only under `startup`)
 
-- Direct buffer manipulation with `bytes::BytesMut`
-- No allocations in the hot path for protocol framing
-- Zero-copy reads where possible
-- Efficient format code optimization
-- Minimum dependencies
+## Testing
 
-## Safety and Limitations
+Unit and doc tests are hermetic (`cargo test`). The integration suite in
+`tests/live.rs` runs only when `PGSTREAM_TEST_PORT` points at a Postgres server
+with roles `md5_user` / `sha_user` / `pw_user` (passwords `md5` / `sha` / `pw`)
+and a trusted `postgres` superuser:
 
-- **No SQL injection protection** - You are responsible for sanitizing inputs
-- **No connection pooling** - Single connection per `PgConnection`
-- **Manual resource management** - You must close statements and portals
-- **Incomplete auth support** - Only Trust, SCRAM-SHA-256, and cleartext password
+```sh
+PGSTREAM_TEST_PORT=5432 cargo test --test live --all-features
+```
+
+## Safety and limitations
+
+- **No SQL injection protection** - sanitize your own inputs
+- **No connection pooling** - one connection per `PgConnection`
+- **Manual resource management** - close statements and portals yourself
+
+[`Bindable`]: https://docs.rs/pg_stream/latest/pg_stream/message/trait.Bindable.html
+[`PgMessage`]: https://docs.rs/pg_stream/latest/pg_stream/message/enum.PgMessage.html
+[`GssProvider`]: https://docs.rs/pg_stream/latest/pg_stream/startup/trait.GssProvider.html
+[`MessageLimits`]: https://docs.rs/pg_stream/latest/pg_stream/message/struct.MessageLimits.html

@@ -19,79 +19,97 @@ pub struct DataRow {
 
 impl DataRow {
     /// Returns the number of columns in this row.
+    #[inline]
     pub fn column_count(&self) -> u16 {
         self.column_count
     }
 
-    /// Returns the value of the column at the given index, or `None` if the value is NULL.
-    ///
-    /// Returns `None` if the index is out of bounds.
+    /// Iterates the column values in a single O(n) pass, yielding `Some(bytes)`
+    /// for a present value or `None` for SQL NULL. Prefer this over calling
+    /// [`column`](Self::column) in a loop, which walks the row each time.
+    #[inline]
+    pub fn iter(&self) -> DataRowIter<'_> {
+        DataRowIter {
+            body: &self.body,
+            offset: 2, // skip column count
+            remaining: self.column_count,
+        }
+    }
+
+    /// Returns the column at `idx`, or `None` if NULL or out of bounds. Walks
+    /// from the start; use [`iter`](Self::iter) to read every column in one pass.
+    #[inline]
     pub fn column(&self, idx: usize) -> Option<&[u8]> {
-        if idx >= self.column_count as usize {
-            return None;
-        }
-
-        let mut offset = 2; // Skip column count
-        for i in 0..=idx {
-            if offset + 4 > self.body.len() {
-                return None;
-            }
-            let len = i32::from_be_bytes([
-                self.body[offset],
-                self.body[offset + 1],
-                self.body[offset + 2],
-                self.body[offset + 3],
-            ]);
-            offset += 4;
-
-            if i == idx {
-                if len < 0 {
-                    return None; // NULL
-                }
-                let len = len as usize;
-                if offset + len > self.body.len() {
-                    return None;
-                }
-                return Some(&self.body[offset..offset + len]);
-            }
-
-            if len >= 0 {
-                offset += len as usize;
-            }
-        }
-        None
+        self.iter().nth(idx).flatten()
     }
 
     /// Returns `true` if the column at the given index is NULL.
     ///
-    /// Returns `false` if the index is out of bounds (treat as not-NULL for safety).
+    /// Returns `false` if the index is out of bounds.
+    #[inline]
     pub fn is_null(&self, idx: usize) -> bool {
-        if idx >= self.column_count as usize {
-            return false;
+        matches!(self.iter().nth(idx), Some(None))
+    }
+}
+
+impl<'a> IntoIterator for &'a DataRow {
+    type Item = Option<&'a [u8]>;
+    type IntoIter = DataRowIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+/// Iterator over the columns of a [`DataRow`], yielding `None` for SQL NULL.
+#[derive(Debug, Clone)]
+pub struct DataRowIter<'a> {
+    body: &'a [u8],
+    offset: usize,
+    remaining: u16,
+}
+
+impl<'a> Iterator for DataRowIter<'a> {
+    type Item = Option<&'a [u8]>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
         }
+        // One slice-and-split per column: the length prefix and the value are
+        // read through a single bounds check instead of five indexing ops.
+        let Some((len_bytes, values)) = self
+            .body
+            .get(self.offset..)
+            .and_then(|rest| rest.split_at_checked(4))
+        else {
+            self.remaining = 0;
+            return None;
+        };
+        let len = i32::from_be_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]]);
+        self.offset += 4;
+        self.remaining -= 1;
 
-        let mut offset = 2; // Skip column count
-        for i in 0..=idx {
-            if offset + 4 > self.body.len() {
-                return false;
+        if len < 0 {
+            return Some(None); // NULL
+        }
+        match values.get(..len as usize) {
+            Some(col) => {
+                self.offset += len as usize;
+                Some(Some(col))
             }
-            let len = i32::from_be_bytes([
-                self.body[offset],
-                self.body[offset + 1],
-                self.body[offset + 2],
-                self.body[offset + 3],
-            ]);
-            offset += 4;
-
-            if i == idx {
-                return len < 0;
-            }
-
-            if len >= 0 {
-                offset += len as usize;
+            None => {
+                self.remaining = 0;
+                Some(None)
             }
         }
-        false
+    }
+
+    // A truncated body stops iteration early, so the declared column count is
+    // only an upper bound.
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, Some(self.remaining as usize))
     }
 }
 
@@ -116,17 +134,20 @@ impl std::fmt::Debug for RowDescription {
 
 impl RowDescription {
     /// Returns the number of columns.
+    #[inline]
     pub fn column_count(&self) -> u16 {
         self.column_names.len() as u16
     }
 
     /// Returns the column name at the given index.
+    #[inline]
     pub fn column_name(&self, idx: usize) -> Option<Cow<'_, str>> {
         let range = self.column_names.get(idx)?;
         Some(String::from_utf8_lossy(&self.body[range.clone()]))
     }
 
     /// Returns the table OID for the column at the given index.
+    #[inline]
     pub fn table_oid(&self, idx: usize) -> Option<u32> {
         let fixed_offset = self.fixed_data_offset(idx)?;
         Some(u32::from_be_bytes([
@@ -138,6 +159,7 @@ impl RowDescription {
     }
 
     /// Returns the column ID (attribute number) at the given index.
+    #[inline]
     pub fn column_id(&self, idx: usize) -> Option<u16> {
         let fixed_offset = self.fixed_data_offset(idx)?;
         Some(u16::from_be_bytes([
@@ -147,6 +169,7 @@ impl RowDescription {
     }
 
     /// Returns the type OID for the column at the given index.
+    #[inline]
     pub fn type_oid(&self, idx: usize) -> Option<u32> {
         let fixed_offset = self.fixed_data_offset(idx)?;
         Some(u32::from_be_bytes([
@@ -158,6 +181,7 @@ impl RowDescription {
     }
 
     /// Returns the type size for the column at the given index.
+    #[inline]
     pub fn type_size(&self, idx: usize) -> Option<i16> {
         let fixed_offset = self.fixed_data_offset(idx)?;
         Some(i16::from_be_bytes([
@@ -167,6 +191,7 @@ impl RowDescription {
     }
 
     /// Returns the type modifier for the column at the given index.
+    #[inline]
     pub fn type_modifier(&self, idx: usize) -> Option<i32> {
         let fixed_offset = self.fixed_data_offset(idx)?;
         Some(i32::from_be_bytes([
@@ -178,6 +203,7 @@ impl RowDescription {
     }
 
     /// Returns the format code for the column at the given index.
+    #[inline]
     pub fn format(&self, idx: usize) -> Option<FormatCode> {
         let fixed_offset = self.fixed_data_offset(idx)?;
         let code = u16::from_be_bytes([self.body[fixed_offset + 16], self.body[fixed_offset + 17]]);
@@ -189,6 +215,7 @@ impl RowDescription {
     }
 
     /// Returns the offset to the fixed-size data (after the null-terminated name)
+    #[inline]
     fn fixed_data_offset(&self, idx: usize) -> Option<usize> {
         let range = self.column_names.get(idx)?;
         Some(range.end + 1) // +1 to skip the null terminator
@@ -216,6 +243,7 @@ impl std::fmt::Debug for CommandComplete {
 
 impl CommandComplete {
     /// Returns the command tag (e.g., "SELECT 5", "INSERT 0 1", "UPDATE 3").
+    #[inline]
     pub fn tag(&self) -> Cow<'_, str> {
         String::from_utf8_lossy(&self.body[..self.tag_len])
     }
@@ -231,6 +259,7 @@ impl CommandComplete {
     /// - "UPDATE 3" → `Some(3)`
     /// - "DELETE 2" → `Some(2)`
     /// - "CREATE TABLE" → `None`
+    #[inline]
     pub fn rows_affected(&self) -> Option<u64> {
         let tag = self.tag();
         tag.split_whitespace().last().and_then(|s| s.parse().ok())
@@ -260,16 +289,19 @@ impl std::fmt::Debug for NotificationResponse {
 
 impl NotificationResponse {
     /// Returns the process ID of the notifying backend.
+    #[inline]
     pub fn process_id(&self) -> u32 {
         u32::from_be_bytes([self.body[0], self.body[1], self.body[2], self.body[3]])
     }
 
     /// Returns the name of the notification channel.
+    #[inline]
     pub fn channel(&self) -> Cow<'_, str> {
         String::from_utf8_lossy(&self.body[self.channel.clone()])
     }
 
     /// Returns the notification payload.
+    #[inline]
     pub fn payload(&self) -> Cow<'_, str> {
         String::from_utf8_lossy(&self.body[self.payload.clone()])
     }
@@ -286,11 +318,13 @@ pub struct ParameterDescription {
 
 impl ParameterDescription {
     /// Returns the number of parameters.
+    #[inline]
     pub fn param_count(&self) -> u16 {
         self.param_count
     }
 
     /// Returns the OID of the parameter type at the given index.
+    #[inline]
     pub fn param_oid(&self, idx: usize) -> Option<u32> {
         if idx >= self.param_count as usize {
             return None;
@@ -380,91 +414,109 @@ impl ErrorResponse {
     }
 
     /// Returns the localized severity (e.g., "ERROR", "FATAL", "WARNING").
+    #[inline]
     pub fn local_severity(&self) -> Cow<'_, str> {
         String::from_utf8_lossy(&self.body[self.local_severity.clone()])
     }
 
     /// Returns the severity in a non-localized form (e.g., "ERROR", "FATAL").
+    #[inline]
     pub fn severity(&self) -> Cow<'_, str> {
         String::from_utf8_lossy(&self.body[self.severity.clone()])
     }
 
     /// Returns the SQLSTATE error code.
+    #[inline]
     pub fn code(&self) -> Cow<'_, str> {
         String::from_utf8_lossy(&self.body[self.code.clone()])
     }
 
     /// Returns the primary human-readable error message.
+    #[inline]
     pub fn message(&self) -> Cow<'_, str> {
         String::from_utf8_lossy(&self.body[self.message.clone()])
     }
 
     /// Returns additional detail about the error.
+    #[inline]
     pub fn detail(&self) -> Option<Cow<'_, str>> {
         self.optional_field(&self.detail)
     }
 
     /// Returns a hint for fixing the error.
+    #[inline]
     pub fn hint(&self) -> Option<Cow<'_, str>> {
         self.optional_field(&self.hint)
     }
 
     /// Returns the cursor position where the error occurred.
+    #[inline]
     pub fn position(&self) -> Option<Cow<'_, str>> {
         self.optional_field(&self.position)
     }
 
     /// Returns the cursor position in the internal query where the error occurred.
+    #[inline]
     pub fn internal_position(&self) -> Option<Cow<'_, str>> {
         self.optional_field(&self.internal_position)
     }
 
     /// Returns the internal query that caused the error.
+    #[inline]
     pub fn internal_query(&self) -> Option<Cow<'_, str>> {
         self.optional_field(&self.internal_query)
     }
 
     /// Returns the context/call stack where the error occurred.
+    #[inline]
     pub fn r#where(&self) -> Option<Cow<'_, str>> {
         self.optional_field(&self.r#where)
     }
 
     /// Returns the schema name related to the error.
+    #[inline]
     pub fn schema(&self) -> Option<Cow<'_, str>> {
         self.optional_field(&self.schema)
     }
 
     /// Returns the table name related to the error.
+    #[inline]
     pub fn table(&self) -> Option<Cow<'_, str>> {
         self.optional_field(&self.table)
     }
 
     /// Returns the column name related to the error.
+    #[inline]
     pub fn column(&self) -> Option<Cow<'_, str>> {
         self.optional_field(&self.column)
     }
 
     /// Returns the data type name related to the error.
+    #[inline]
     pub fn datatype(&self) -> Option<Cow<'_, str>> {
         self.optional_field(&self.datatype)
     }
 
     /// Returns the constraint name related to the error.
+    #[inline]
     pub fn constraint(&self) -> Option<Cow<'_, str>> {
         self.optional_field(&self.constraint)
     }
 
     /// Returns the source file where the error was reported.
+    #[inline]
     pub fn file(&self) -> Option<Cow<'_, str>> {
         self.optional_field(&self.file)
     }
 
     /// Returns the source line number where the error was reported.
+    #[inline]
     pub fn line(&self) -> Option<Cow<'_, str>> {
         self.optional_field(&self.line)
     }
 
     /// Returns the source routine name where the error was reported.
+    #[inline]
     pub fn routine(&self) -> Option<Cow<'_, str>> {
         self.optional_field(&self.routine)
     }
@@ -483,6 +535,7 @@ pub struct ReadyForQuery {
 
 impl ReadyForQuery {
     /// Returns the current transaction status.
+    #[inline]
     pub fn status(&self) -> TransactionStatus {
         self.status
     }
@@ -499,25 +552,41 @@ pub enum TransactionStatus {
     Failed,
 }
 
-/// A wrapper for a BackendKeyData message.
-///
-/// BackendKeyData provides the process ID and secret key needed
-/// for cancellation requests.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A zero-copy wrapper for a BackendKeyData message: the process ID and secret
+/// key needed for cancellation requests. Protocol 3.2 widened the secret key
+/// from four bytes to a variable-length field.
+#[derive(Clone, PartialEq, Eq)]
 pub struct BackendKeyData {
-    pub(super) process_id: u32,
-    pub(super) secret_key: u32,
+    pub(super) body: Bytes,
+}
+
+impl std::fmt::Debug for BackendKeyData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BackendKeyData")
+            .field("process_id", &self.process_id())
+            .field("secret_key_len", &self.secret_key().len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl BackendKeyData {
+    /// Shortest secret key the protocol allows (the fixed size before 3.2).
+    pub const MIN_SECRET_KEY_LEN: usize = 4;
+
+    /// Longest secret key the protocol allows. PostgreSQL sends at most 32
+    /// bytes; the rest of the range is reserved for poolers and middleware.
+    pub const MAX_SECRET_KEY_LEN: usize = 256;
+
     /// Returns the backend process ID.
+    #[inline]
     pub fn process_id(&self) -> u32 {
-        self.process_id
+        u32::from_be_bytes([self.body[0], self.body[1], self.body[2], self.body[3]])
     }
 
     /// Returns the secret key for cancellation.
-    pub fn secret_key(&self) -> u32 {
-        self.secret_key
+    #[inline]
+    pub fn secret_key(&self) -> &[u8] {
+        &self.body[4..]
     }
 }
 
@@ -542,13 +611,139 @@ impl std::fmt::Debug for ParameterStatus {
 
 impl ParameterStatus {
     /// Returns the parameter name.
+    #[inline]
     pub fn name(&self) -> Cow<'_, str> {
         String::from_utf8_lossy(&self.body[self.name.clone()])
     }
 
     /// Returns the parameter value.
+    #[inline]
     pub fn value(&self) -> Cow<'_, str> {
         String::from_utf8_lossy(&self.body[self.value.clone()])
+    }
+}
+
+/// A typed Authentication request from the server. SASL/GSS variants carry the
+/// raw mechanism payload for the caller or handshake to interpret.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Authentication {
+    /// Authentication succeeded.
+    Ok,
+    /// Kerberos V5 authentication is required (obsolete).
+    KerberosV5,
+    /// A cleartext password is required.
+    CleartextPassword,
+    /// An MD5-hashed password is required, salted with these 4 bytes.
+    Md5Password { salt: [u8; 4] },
+    /// GSSAPI authentication is required.
+    Gss,
+    /// A GSSAPI/SSPI continuation with server data.
+    GssContinue(Bytes),
+    /// SSPI authentication is required.
+    Sspi,
+    /// SASL authentication is required; body is the nul-separated mechanism list.
+    Sasl(Bytes),
+    /// A SASL challenge with server data.
+    SaslContinue(Bytes),
+    /// The final SASL server message.
+    SaslFinal(Bytes),
+    /// An authentication request type not modeled here; raw code and body.
+    Unknown { code: u32, body: Bytes },
+}
+
+impl Authentication {
+    /// Returns `true` if this is [`Authentication::Ok`].
+    #[inline]
+    pub fn is_ok(&self) -> bool {
+        matches!(self, Authentication::Ok)
+    }
+
+    /// For [`Authentication::Sasl`], iterates the offered mechanism names.
+    #[inline]
+    pub fn sasl_mechanisms(&self) -> impl Iterator<Item = &str> {
+        let body = match self {
+            Authentication::Sasl(body) => body.as_ref(),
+            _ => &[][..],
+        };
+        body.split(|&b| b == 0)
+            .filter(|m| !m.is_empty())
+            .filter_map(|m| std::str::from_utf8(m).ok())
+    }
+}
+
+/// A zero-copy wrapper for a FunctionCallResponse message.
+#[derive(Clone)]
+pub struct FunctionCallResponse {
+    pub(super) body: Bytes,
+}
+
+impl std::fmt::Debug for FunctionCallResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FunctionCallResponse")
+            .field("value", &self.value())
+            .finish()
+    }
+}
+
+impl FunctionCallResponse {
+    /// Returns the result value, or `None` if the function returned NULL.
+    #[inline]
+    pub fn value(&self) -> Option<&[u8]> {
+        if self.body.len() < 4 {
+            return None;
+        }
+        let len = i32::from_be_bytes([self.body[0], self.body[1], self.body[2], self.body[3]]);
+        if len < 0 {
+            return None;
+        }
+        let len = len as usize;
+        self.body.get(4..4 + len)
+    }
+}
+
+/// A zero-copy wrapper for a NegotiateProtocolVersion message.
+///
+/// Sent when the server supports a lower minor protocol version than requested,
+/// or does not recognize some startup options.
+#[derive(Clone)]
+pub struct NegotiateProtocolVersion {
+    pub(super) body: Bytes,
+    pub(super) option_count: u32,
+}
+
+impl std::fmt::Debug for NegotiateProtocolVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NegotiateProtocolVersion")
+            .field("minor_version", &self.minor_version())
+            .field(
+                "unrecognized_options",
+                &self.unrecognized_options().collect::<Vec<_>>(),
+            )
+            .finish()
+    }
+}
+
+impl NegotiateProtocolVersion {
+    /// The newest minor protocol version supported by the server.
+    #[inline]
+    pub fn minor_version(&self) -> u32 {
+        u32::from_be_bytes([self.body[0], self.body[1], self.body[2], self.body[3]])
+    }
+
+    /// The number of startup options the server did not recognize.
+    #[inline]
+    pub fn option_count(&self) -> u32 {
+        self.option_count
+    }
+
+    /// Iterates the names of startup options the server did not recognize.
+    #[inline]
+    pub fn unrecognized_options(&self) -> impl Iterator<Item = Cow<'_, str>> {
+        self.body[8..]
+            .split(|&b| b == 0)
+            .filter(|s| !s.is_empty())
+            .take(self.option_count as usize)
+            .map(String::from_utf8_lossy)
     }
 }
 
@@ -561,6 +756,7 @@ pub struct CopyResponse {
 
 impl CopyResponse {
     /// Returns the overall copy format.
+    #[inline]
     pub fn format(&self) -> FormatCode {
         if self.body[0] == 0 {
             FormatCode::Text
@@ -570,11 +766,13 @@ impl CopyResponse {
     }
 
     /// Returns the number of columns.
+    #[inline]
     pub fn column_count(&self) -> u16 {
         self.column_count
     }
 
     /// Returns the format code for a specific column.
+    #[inline]
     pub fn column_format(&self, idx: usize) -> Option<FormatCode> {
         if idx >= self.column_count as usize {
             return None;
