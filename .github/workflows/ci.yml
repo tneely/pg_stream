@@ -14,7 +14,7 @@ jobs:
     name: Test & lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -47,7 +47,7 @@ jobs:
           - async,startup
           - async,sync,startup
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build (${{ matrix.features }})
@@ -57,7 +57,7 @@ jobs:
     name: Live integration
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -76,6 +76,7 @@ jobs:
           {
             echo "port = 54329"
             echo "listen_addresses = 'localhost'"
+            echo "unix_socket_directories = '/tmp'"
             echo "ssl = on"
           } >> "$PGDATA/postgresql.conf"
           cat > "$PGDATA/pg_hba.conf" <<'HBA'
@@ -87,7 +88,8 @@ jobs:
           host    all       postgres   127.0.0.1/32          trust
           host    all       all        127.0.0.1/32          reject
           HBA
-          "$PGBIN/pg_ctl" -D "$PGDATA" -l "$PGDATA/server.log" -w start
+          "$PGBIN/pg_ctl" -D "$PGDATA" -l "$PGDATA/server.log" -w start ||
+            { cat "$PGDATA/server.log"; exit 1; }
           psql -h /tmp -p 54329 -U postgres -v ON_ERROR_STOP=1 <<'SQL'
           SET password_encryption = 'md5';
           CREATE ROLE md5_user WITH LOGIN PASSWORD 'md5';
