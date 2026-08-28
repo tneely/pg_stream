@@ -336,10 +336,10 @@ mod tests {
         let mut conn = PgConnection::new(stream);
 
         // Test that builders return &mut PgConnection for chaining
-        conn.parse(None)
-            .query("SELECT $1")
-            .finish()
-            .execute(None, 0)
+        conn.parse("", "SELECT $1", &[])
+            .bind("")
+            .finish(crate::params![1i32])
+            .execute("", 0)
             .sync();
 
         assert!(conn.pending_len() > 0);

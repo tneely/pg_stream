@@ -9,6 +9,7 @@
 //! ```text
 //! PGSTREAM_TEST_PORT=54329 PGSTREAM_TEST_TLS=1 cargo test --test live --all-features
 //! ```
+#![cfg(feature = "startup")]
 
 use std::sync::Arc;
 
@@ -110,14 +111,11 @@ async fn extended_protocol_roundtrip() {
     let port = require_server!();
     let (mut conn, _) = connect("postgres", None, port).await;
 
-    conn.parse(Some("stmt1"))
-        .query("SELECT $1::int + 1")
-        .param_types(&[oid::INT4])
-        .finish()
-        .bind(Some("portal1"))
+    conn.parse("stmt1", "SELECT $1::int + 1", &[oid::INT4])
+        .bind("portal1")
         .statement("stmt1")
         .finish(params![2i32])
-        .execute(Some("portal1"), 0)
+        .execute("portal1", 0)
         .sync();
     conn.flush().await.unwrap();
 
@@ -244,7 +242,7 @@ async fn scram_sha256_plus_channel_binding() {
     use tokio_rustls::TlsConnector;
     use tokio_rustls::rustls::{ClientConfig, pki_types::ServerName};
 
-    tokio_rustls::rustls::crypto::aws_lc_rs::default_provider()
+    tokio_rustls::rustls::crypto::ring::default_provider()
         .install_default()
         .ok();
 
@@ -332,7 +330,7 @@ impl tokio_rustls::rustls::client::danger::ServerCertVerifier for NoVerify {
     }
 
     fn supported_verify_schemes(&self) -> Vec<tokio_rustls::rustls::SignatureScheme> {
-        tokio_rustls::rustls::crypto::aws_lc_rs::default_provider()
+        tokio_rustls::rustls::crypto::ring::default_provider()
             .signature_verification_algorithms
             .supported_schemes()
     }

@@ -19,8 +19,11 @@
 
 use std::num::NonZeroU32;
 
-use aws_lc_rs::{digest, hmac, pbkdf2, rand};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use hmac::{Hmac, Mac};
+use sha2::{Digest, Sha256, Sha384, Sha512};
+
+type HmacSha256 = Hmac<Sha256>;
 
 /// Maximum server-selected PBKDF2 iteration count accepted by the client.
 ///
@@ -92,8 +95,7 @@ impl ChannelBinding {
 /// (MD5/SHA-1 upgraded to SHA-256). Feed to [`ChannelBinding::TlsServerEndPoint`].
 pub fn tls_server_end_point(cert_der: &[u8]) -> Result<Vec<u8>, ScramError> {
     let oid = cert_signature_oid(cert_der).ok_or(ScramError::InvalidCertificate)?;
-    let alg = digest_for_signature_oid(&oid);
-    Ok(digest::digest(alg, cert_der).as_ref().to_vec())
+    Ok(digest_for_signature_oid(&oid)(cert_der))
 }
 
 impl std::fmt::Display for ScramError {
@@ -336,7 +338,7 @@ impl ScramClient {
 /// Generates a random nonce for SCRAM authentication.
 fn generate_nonce() -> String {
     let mut bytes = [0u8; 18];
-    rand::fill(&mut bytes).expect("random generation failed");
+    getrandom::fill(&mut bytes).expect("random generation failed");
     BASE64.encode(bytes)
 }
 
@@ -439,7 +441,7 @@ fn cert_signature_oid(cert_der: &[u8]) -> Option<Vec<u8>> {
 
 /// Maps a signature algorithm OID to its channel-binding digest. Per RFC 5929
 /// MD5/SHA-1 upgrade to SHA-256; unknown OIDs default to SHA-256 like Postgres.
-fn digest_for_signature_oid(oid: &[u8]) -> &'static digest::Algorithm {
+fn digest_for_signature_oid(oid: &[u8]) -> fn(&[u8]) -> Vec<u8> {
     // OID bytes after the DER tag/len, i.e. the value only.
     // sha384WithRSAEncryption 1.2.840.113549.1.1.12
     const SHA384_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0c];
@@ -450,37 +452,49 @@ fn digest_for_signature_oid(oid: &[u8]) -> &'static digest::Algorithm {
     // ecdsa-with-SHA512 1.2.840.10045.4.3.4
     const SHA512_ECDSA: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x04];
 
+    fn digest<D: Digest>(data: &[u8]) -> Vec<u8> {
+        D::digest(data).to_vec()
+    }
+
     match oid {
-        SHA384_RSA | SHA384_ECDSA => &digest::SHA384,
-        SHA512_RSA | SHA512_ECDSA => &digest::SHA512,
-        _ => &digest::SHA256,
+        SHA384_RSA | SHA384_ECDSA => digest::<Sha384>,
+        SHA512_RSA | SHA512_ECDSA => digest::<Sha512>,
+        _ => digest::<Sha256>,
     }
 }
 
-/// Computes PBKDF2-HMAC-SHA256.
+/// Computes PBKDF2-HMAC-SHA256 (RFC 8018) for a single output block, which is
+/// all SCRAM-SHA-256 needs since its key length equals the hash length.
 fn pbkdf2_sha256(password: &[u8], salt: &[u8], iterations: NonZeroU32) -> [u8; 32] {
-    let mut result = [0u8; 32];
-    pbkdf2::derive(
-        pbkdf2::PBKDF2_HMAC_SHA256,
-        iterations,
-        salt,
-        password,
-        &mut result,
-    );
+    let prf = HmacSha256::new_from_slice(password).expect("HMAC accepts any key length");
+
+    let mut mac = prf.clone();
+    mac.update(salt);
+    mac.update(&1u32.to_be_bytes());
+    let mut u: [u8; 32] = mac.finalize().into_bytes().into();
+
+    let mut result = u;
+    for _ in 1..iterations.get() {
+        let mut mac = prf.clone();
+        mac.update(&u);
+        u = mac.finalize().into_bytes().into();
+        for (r, b) in result.iter_mut().zip(u) {
+            *r ^= b;
+        }
+    }
     result
 }
 
 /// Computes HMAC-SHA256.
 fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
-    let hmac_key = hmac::Key::new(hmac::HMAC_SHA256, key);
-    let tag = hmac::sign(&hmac_key, data);
-    tag.as_ref().try_into().expect("HMAC-SHA256 is 32 bytes")
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(data);
+    mac.finalize().into_bytes().into()
 }
 
 /// Computes SHA256.
 fn sha256(data: &[u8]) -> [u8; 32] {
-    let digest = digest::digest(&digest::SHA256, data);
-    digest.as_ref().try_into().expect("SHA256 is 32 bytes")
+    Sha256::digest(data).into()
 }
 
 /// XORs two byte arrays.
@@ -544,22 +558,30 @@ mod tests {
         assert!(client_first.contains("r=rOprNGfwEbeRWgbNEkqO"));
     }
 
+    /// The complete SCRAM-SHA-256 test vector from RFC 7677 section 3, pinning
+    /// the PBKDF2/HMAC/SHA-256 stack to published values.
     #[test]
-    fn test_scram_full_flow() {
-        // Test vector from RFC 5802 adapted for SHA-256
+    fn test_scram_full_flow_rfc7677_vector() {
         let mut client = ScramClient::with_nonce("user", "pencil", "rOprNGfwEbeRWgbNEkqO");
 
-        // Step 1: Client first
         let client_first = client.client_first();
         assert_eq!(client_first, "n,,n=user,r=rOprNGfwEbeRWgbNEkqO");
 
-        // Step 2: Server first (simulated)
         let server_first = "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096";
-
-        // Step 3: Client final
         let client_final = client.client_final(server_first).unwrap();
-        assert!(client_final.starts_with("c=biws,r="));
-        assert!(client_final.contains(",p="));
+        assert_eq!(
+            client_final,
+            "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,\
+             p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ="
+        );
+
+        client
+            .verify_server("v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=")
+            .expect("RFC 7677 server signature should verify");
+        assert!(matches!(
+            client.verify_server("v=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
+            Err(ScramError::ServerSignatureMismatch)
+        ));
     }
 
     #[test]
@@ -650,7 +672,7 @@ mod tests {
 
         // With SHA-256 signature, binding data is SHA-256 of the whole cert.
         let binding = tls_server_end_point(&der).unwrap();
-        assert_eq!(binding, digest::digest(&digest::SHA256, &der).as_ref());
+        assert_eq!(binding, Sha256::digest(&der).to_vec());
         assert_eq!(binding.len(), 32);
     }
 

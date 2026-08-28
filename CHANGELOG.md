@@ -21,8 +21,8 @@
   `MessageReader`. Sync read errors no longer expose zero-filled spare capacity
   as wire data, and initialized spare memory is reused across short reads.
 - **Bounded SCRAM work**: server iteration counts must be in
-  `1..=MAX_SCRAM_ITERATIONS`; PBKDF2 during async startup runs on Tokio's
-  blocking pool.
+  `1..=MAX_SCRAM_ITERATIONS`. PBKDF2 runs inline, ~1ms at PostgreSQL's default
+  4,096 iterations.
 - **Authentication notice streams** are handled by an iterative loop rather
   than recursively boxed futures.
 - **Frame length underflow (DoS)**: a backend length field below 4 no longer
@@ -61,8 +61,8 @@
 - **Complete PostgreSQL 18 authentication**:
   - `SCRAM-SHA-256-PLUS` channel binding (`tls-server-end-point`), selected
     automatically when TLS is in use and the server certificate is available.
-    Includes the `y,,` downgrade-detection flag when TLS is present but only the
-    non-PLUS mechanism is offered.
+    Includes the `y,,` downgrade-detection flag when the server certificate is
+    available but only the non-PLUS mechanism is offered.
   - `OAUTHBEARER` (RFC 7628) via `AuthenticationMode::OAuthBearer(token)`, new
     for PostgreSQL 18's `oauth` method.
   - GSSAPI/SSPI via `ConnectionBuilder::connect_with_gss` and the `GssProvider`
@@ -76,6 +76,24 @@
 
 ### Changed
 
+- **Statement/portal names are `&str`, not `Option<&str>`**. The protocol
+  defines the empty string as the unnamed statement/portal, so the API now says
+  the same: `conn.execute("portal", 0)` or `conn.execute("", 0)`. Applies to
+  `parse`, `bind`, `execute`, `describe_portal`, `describe_statement`,
+  `close_portal`, and `close_statement`.
+- **`parse` is a single call**: `buf.parse(name, query, param_types)`. The
+  `ParseBuilder` typestate existed only to force the query argument.
+  `BindBuilder`/`FnCallBuilder` remain for their genuinely optional knobs.
+- **`aws-lc-rs` replaced by `sha2` + `hmac` + `getrandom`**. SCRAM needed only
+  SHA-256/384/512, HMAC-SHA-256, PBKDF2 (now a small loop over HMAC, pinned to
+  the RFC 7677 test vector), and 18 random bytes. The dependency tree is pure
+  Rust: no C toolchain or cmake, and a cold `cargo build --release` of the
+  library drops from ~18s to ~2s.
+- **`ConnectionBuilder` startup options are ordered** (`application_name`,
+  `database`, `user`, then any `add_option`), so the startup packet is
+  deterministic. `add_option` still replaces an existing key.
+- `message::MessageCode` is now exported, so `PgMessage::Unknown`'s `code` field
+  has a nameable type.
 - **`PgConnection::into_parts`** now returns `(stream, write_buf, read_buf)`
   (was `(stream, buf)`) so buffered incoming bytes are not lost.
 - **`PgConnection::stream_mut`** now returns `io::Result<&mut S>` and denies
@@ -94,6 +112,13 @@
 
 ### Removed
 
+- The `ParseBuilder` typestate (`ParseBuilder`, `NeedsQuery`, `Ready`),
+  subsumed by the single-call `parse`.
+- The exported `pg_frame!` macro and its `__pg_frame_*` helpers. They
+  referenced private modules, so they could never compile outside the crate;
+  they are internal now.
+- The frontend `MessageCode::CANCEL_REQUEST` / `GSSENC_REQUEST` constants; those
+  wire values are special-packet lengths, not message codes.
 - The stateless `read_message` / `read_message_sync` functions. Use a persistent
   `MessageReader`; stateless async framing cannot preserve consumed bytes when
   its future is cancelled.

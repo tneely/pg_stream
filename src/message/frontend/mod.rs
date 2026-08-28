@@ -10,16 +10,15 @@ mod codec;
 mod types;
 
 pub use bindable::Bindable;
-pub use builders::{BindBuilder, FnCallBuilder, NeedsQuery, ParseBuilder, Ready};
+pub use builders::{BindBuilder, FnCallBuilder};
 pub use code::MessageCode;
-// Low-level framing helpers, used by the startup/auth handshake.
-#[cfg(feature = "startup")]
+// Low-level framing helpers, also used by the startup/auth handshake.
 pub use codec::{cstring_len, frame};
 pub use types::{FormatCode, Oid, oid};
 
 use bytes::BufMut;
 
-use crate::pg_frame;
+use codec::{pg_frame, put_cstring};
 
 /// Extension trait for writing Postgres frontend protocol messages.
 ///
@@ -61,68 +60,36 @@ pub trait PgProtocol: BufMut + Sized {
         self
     }
 
-    /// Write an Execute message.
-    ///
-    /// Specify `None` to execute an unnamed portal.
-    fn execute(&mut self, portal: Option<&str>, max_rows: u32) -> &mut Self {
-        pg_frame!(
-            self,
-            MessageCode::EXECUTE,
-            cstring(portal.unwrap_or("")),
-            u32(max_rows)
-        );
+    /// Write an Execute message. An empty `portal` executes the unnamed
+    /// portal; a `max_rows` of 0 means unlimited.
+    fn execute(&mut self, portal: &str, max_rows: u32) -> &mut Self {
+        pg_frame!(self, MessageCode::EXECUTE, cstring(portal), u32(max_rows));
         self
     }
 
-    /// Write a Describe message for a portal.
-    ///
-    /// Specify `None` to describe an unnamed portal.
-    fn describe_portal(&mut self, name: Option<&str>) -> &mut Self {
-        pg_frame!(
-            self,
-            MessageCode::DESCRIBE,
-            u8(b'P'),
-            cstring(name.unwrap_or(""))
-        );
+    /// Write a Describe message for a portal (empty `name` for the unnamed one).
+    fn describe_portal(&mut self, name: &str) -> &mut Self {
+        pg_frame!(self, MessageCode::DESCRIBE, u8(b'P'), cstring(name));
         self
     }
 
-    /// Write a Describe message for a prepared statement.
-    ///
-    /// Specify `None` to describe an unnamed statement.
-    fn describe_statement(&mut self, name: Option<&str>) -> &mut Self {
-        pg_frame!(
-            self,
-            MessageCode::DESCRIBE,
-            u8(b'S'),
-            cstring(name.unwrap_or(""))
-        );
+    /// Write a Describe message for a prepared statement (empty `name` for the
+    /// unnamed one).
+    fn describe_statement(&mut self, name: &str) -> &mut Self {
+        pg_frame!(self, MessageCode::DESCRIBE, u8(b'S'), cstring(name));
         self
     }
 
-    /// Write a Close message for a portal.
-    ///
-    /// Specify `None` to prepare an unnamed portal.
-    fn close_portal(&mut self, name: Option<&str>) -> &mut Self {
-        pg_frame!(
-            self,
-            MessageCode::CLOSE,
-            u8(b'P'),
-            cstring(name.unwrap_or(""))
-        );
+    /// Write a Close message for a portal (empty `name` for the unnamed one).
+    fn close_portal(&mut self, name: &str) -> &mut Self {
+        pg_frame!(self, MessageCode::CLOSE, u8(b'P'), cstring(name));
         self
     }
 
-    /// Write a Close message for a prepared statement.
-    ///
-    /// Specify `None` to close an unnamed statement.
-    fn close_statement(&mut self, name: Option<&str>) -> &mut Self {
-        pg_frame!(
-            self,
-            MessageCode::CLOSE,
-            u8(b'S'),
-            cstring(name.unwrap_or(""))
-        );
+    /// Write a Close message for a prepared statement (empty `name` for the
+    /// unnamed one).
+    fn close_statement(&mut self, name: &str) -> &mut Self {
+        pg_frame!(self, MessageCode::CLOSE, u8(b'S'), cstring(name));
         self
     }
 
@@ -150,18 +117,29 @@ pub trait PgProtocol: BufMut + Sized {
         self
     }
 
-    /// Start building a Parse message.
-    ///
-    /// Specify `None` to prepare an unnamed statement.
-    fn parse<'a>(&'a mut self, name: Option<&'a str>) -> ParseBuilder<'a, Self, NeedsQuery> {
-        ParseBuilder::new(self, name)
+    /// Write a Parse message preparing `query` as statement `name` (empty for
+    /// the unnamed statement). Types omitted from `param_types` are inferred.
+    fn parse(&mut self, name: &str, query: &str, param_types: &[Oid]) -> &mut Self {
+        let payload_len = cstring_len(name.as_bytes())
+            + cstring_len(query.as_bytes())
+            + 2
+            + param_types.len() * 4;
+
+        self.put_u8(MessageCode::PARSE.as_u8());
+        frame(self, payload_len, |buf| {
+            put_cstring(buf, name.as_bytes());
+            put_cstring(buf, query.as_bytes());
+            buf.put_u16(param_types.len() as u16);
+            for &oid in param_types {
+                buf.put_u32(oid);
+            }
+        });
+        self
     }
 
-    /// Start building a Bind message.
-    ///
-    /// Specify `None` to bind to an unnamed portal.
-    fn bind<'a>(&'a mut self, name: Option<&'a str>) -> BindBuilder<'a, Self> {
-        BindBuilder::new(self, name)
+    /// Start building a Bind message (empty `portal` for the unnamed portal).
+    fn bind<'a>(&'a mut self, portal: &'a str) -> BindBuilder<'a, Self> {
+        BindBuilder::new(self, portal)
     }
 
     /// Start building a FunctionCall message.
@@ -199,28 +177,28 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_typestate() {
+    fn test_parse_with_param_types() {
         let mut buf = BytesMut::new();
-        buf.parse(Some("stmt1"))
-            .query("SELECT $1::int")
-            .param_types(&[23])
-            .finish();
+        buf.parse("stmt1", "SELECT $1::int", &[23]);
 
         assert_eq!(buf[0], b'P');
+        // name, query, count, one OID
+        assert_eq!(&buf[5..], b"stmt1\0SELECT $1::int\0\0\x01\0\0\0\x17");
     }
 
     #[test]
     fn test_parse_no_param_types() {
         let mut buf = BytesMut::new();
-        buf.parse(None).query("SELECT 1").finish();
+        buf.parse("", "SELECT 1", &[]);
 
         assert_eq!(buf[0], b'P');
+        assert_eq!(&buf[5..], b"\0SELECT 1\0\0\0");
     }
 
     #[test]
     fn test_bind_with_params() {
         let mut buf = BytesMut::new();
-        buf.bind(Some("portal1"))
+        buf.bind("portal1")
             .statement("stmt1")
             .finish(crate::params![42i32, "hello"]);
 
@@ -230,7 +208,7 @@ mod tests {
     #[test]
     fn test_bind_no_params() {
         let mut buf = BytesMut::new();
-        buf.bind(Some("portal1"))
+        buf.bind("portal1")
             .statement("stmt1")
             .finish(crate::params![]);
 
@@ -243,7 +221,7 @@ mod tests {
         let owned = String::from("owned");
 
         let mut with_macro = BytesMut::new();
-        with_macro.bind(None).finish(crate::params![
+        with_macro.bind("").finish(crate::params![
             42i32,
             "hello",
             &owned,
@@ -252,7 +230,7 @@ mod tests {
         ]);
 
         let mut with_dyn = BytesMut::new();
-        with_dyn.bind(None).finish(&[
+        with_dyn.bind("").finish(&[
             &42i32 as &dyn Bindable,
             &"hello" as &dyn Bindable,
             &owned as &dyn Bindable,
@@ -276,12 +254,10 @@ mod tests {
     #[test]
     fn test_chaining() {
         let mut buf = BytesMut::new();
-        buf.parse(Some("s"))
-            .query("SELECT $1")
-            .finish()
-            .bind(Some("s"))
+        buf.parse("s", "SELECT $1", &[])
+            .bind("s")
             .finish(crate::params![1i32])
-            .execute(None, 0)
+            .execute("", 0)
             .sync();
 
         // Count messages

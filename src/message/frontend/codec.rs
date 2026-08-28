@@ -34,9 +34,7 @@ fn frame_len(payload_len: usize) -> u32 {
     u32::try_from(len).expect("frame payload length exceeds u32::MAX - 4")
 }
 
-#[doc(hidden)]
-#[macro_export]
-macro_rules! __pg_frame_len {
+macro_rules! pg_frame_len {
     (u8, $arg:expr) => {
         1usize
     };
@@ -68,10 +66,9 @@ macro_rules! __pg_frame_len {
         $crate::message::frontend::codec::cstring_len(::core::convert::AsRef::<[u8]>::as_ref(&$arg))
     };
 }
+pub(crate) use pg_frame_len;
 
-#[doc(hidden)]
-#[macro_export]
-macro_rules! __pg_frame_write {
+macro_rules! pg_frame_write {
     (u8, $buf:expr, $arg:expr) => {
         bytes::BufMut::put_u8($buf, $arg);
     };
@@ -106,32 +103,26 @@ macro_rules! __pg_frame_write {
         );
     };
 }
+pub(crate) use pg_frame_write;
 
-/// Encode a framed frontend message with a single-pass write.
-///
-/// The macro computes payload length from a list of primitive write ops, writes
-/// the message code + length, then emits payload bytes exactly once.
-///
-/// Supported ops:
-/// - `u8(expr)`, `u16(expr)`, `u32(expr)`
-/// - `i16(expr)`, `i32(expr)`, `i64(expr)`
-/// - `f32(expr)`, `f64(expr)`
-/// - `bytes(expr)` where `expr: impl AsRef<[u8]>`
-/// - `cstring(expr)` where `expr: impl AsRef<[u8]>`
-#[macro_export]
+/// Encode a framed frontend message in a single pass: payload length is summed
+/// from the op list, then code + length + payload are written exactly once.
+/// Ops: `u8`/`u16`/`u32`/`i16`/`i32`/`i64`/`f32`/`f64`, `bytes`, `cstring`.
 macro_rules! pg_frame {
     ($buf:expr, $code:expr $(, $op:ident($arg:expr))* $(,)?) => {{
         let __pg_buf = &mut *$buf;
         let __pg_code = $code;
-        let __pg_payload_len: usize = 0usize $(+ $crate::__pg_frame_len!($op, $arg))*;
+        let __pg_payload_len: usize =
+            0usize $(+ $crate::message::frontend::codec::pg_frame_len!($op, $arg))*;
         bytes::BufMut::put_u8(__pg_buf, __pg_code.as_u8());
         $crate::message::frontend::codec::frame(__pg_buf, __pg_payload_len, |__pg_out| {
             $(
-                $crate::__pg_frame_write!($op, __pg_out, $arg);
+                $crate::message::frontend::codec::pg_frame_write!($op, __pg_out, $arg);
             )*
         });
     }};
 }
+pub(crate) use pg_frame;
 
 #[cfg(test)]
 mod tests {
@@ -174,7 +165,7 @@ mod tests {
     #[test]
     fn test_pg_frame_macro() {
         let mut buf = BytesMut::new();
-        crate::pg_frame!(&mut buf, MessageCode::QUERY, cstring(b"SELECT 1"));
+        pg_frame!(&mut buf, MessageCode::QUERY, cstring(b"SELECT 1"));
 
         assert_eq!(buf[0], b'Q');
         assert_eq!(&buf[1..5], &13u32.to_be_bytes());

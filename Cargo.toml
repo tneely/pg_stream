@@ -14,21 +14,23 @@ categories = ["database"]
 default = ["async", "startup"]
 async = ["dep:tokio"]
 sync = []
-startup = ["async", "dep:aws-lc-rs", "dep:base64", "dep:md5"]
+startup = ["async", "dep:base64", "dep:getrandom", "dep:hmac", "dep:md5", "dep:sha2"]
 
 [dependencies]
 bytes = "1.11"
-tokio = { version = "1.52", optional = true, default-features = false, features = ["io-util", "rt"] }
+tokio = { version = "1.52", optional = true, default-features = false, features = ["io-util"] }
 
 # Crypto dependencies for authentication
-aws-lc-rs = { version = "1.16.3", optional = true }
-base64 ={ version = "0.23", optional = true }
+base64 = { version = "0.23", optional = true }
+getrandom = { version = "0.3", optional = true }
+hmac = { version = "0.12", optional = true }
 md5 = { version = "0.8", optional = true }
+sha2 = { version = "0.10", optional = true }
 
 [dev-dependencies]
 criterion = "0"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread"] }
-tokio-rustls ={ version = "0", features = ["aws-lc-rs"] }
+tokio-rustls = { version = "0", default-features = false, features = ["ring", "tls12", "logging"] }
 
 [[bench]]
 name = "pgstream_bench"

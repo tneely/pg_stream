@@ -57,34 +57,35 @@ fn bench_put_parse(c: &mut Criterion) {
     group.bench_function("no_params", |b| {
         b.iter(|| {
             let mut buf = BytesMut::with_capacity(256);
-            buf.parse(Some(black_box("stmt1")))
-                .query(black_box("SELECT * FROM users WHERE id = $1"))
-                .param_types(black_box(param_types_small))
-                .finish();
+            buf.parse(
+                black_box("stmt1"),
+                black_box("SELECT * FROM users WHERE id = $1"),
+                black_box(param_types_small),
+            );
         });
     });
 
     group.bench_function("three_params", |b| {
         b.iter(|| {
             let mut buf = BytesMut::with_capacity(256);
-            buf.parse(Some(black_box("stmt2")))
-                .query(black_box(
-                    "SELECT * FROM users WHERE id = $1 AND name = $2 AND created_at > $3",
-                ))
-                .param_types(black_box(param_types_medium))
-                .finish();
+            buf.parse(
+                black_box("stmt2"),
+                black_box("SELECT * FROM users WHERE id = $1 AND name = $2 AND created_at > $3"),
+                black_box(param_types_medium),
+            );
         });
     });
 
     group.bench_function("ten_params", |b| {
         b.iter(|| {
             let mut buf = BytesMut::with_capacity(256);
-            buf.parse(Some(black_box("stmt3")))
-                .query(black_box(
+            buf.parse(
+                black_box("stmt3"),
+                black_box(
                     "INSERT INTO large_table VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
-                ))
-                .param_types(black_box(param_types_large))
-                .finish();
+                ),
+                black_box(param_types_large),
+            );
         });
     });
 
@@ -97,7 +98,7 @@ fn bench_put_bind(c: &mut Criterion) {
     group.bench_function("one_param_text_result", |b| {
         b.iter(|| {
             let mut buf = BytesMut::with_capacity(256);
-            buf.bind(None)
+            buf.bind(black_box(""))
                 .statement(black_box(""))
                 .result_format(FormatCode::Text)
                 .finish(params!["42"]);
@@ -108,7 +109,7 @@ fn bench_put_bind(c: &mut Criterion) {
         let binary_data: &[u8] = &[1, 2, 3, 4];
         b.iter(|| {
             let mut buf = BytesMut::with_capacity(256);
-            buf.bind(Some(black_box("portal1")))
+            buf.bind(black_box("portal1"))
                 .statement(black_box("stmt1"))
                 .result_format(FormatCode::Binary)
                 .finish(params!["42", "John Doe", binary_data]);
@@ -121,7 +122,7 @@ fn bench_put_bind(c: &mut Criterion) {
         let none: Option<i32> = None;
         b.iter(|| {
             let mut buf = BytesMut::with_capacity(256);
-            buf.bind(Some(black_box("portal2")))
+            buf.bind(black_box("portal2"))
                 .statement(black_box("stmt2"))
                 .finish(params![
                     "1",
@@ -145,14 +146,14 @@ fn bench_put_describe(c: &mut Criterion) {
     group.bench_function("portal", |b| {
         b.iter(|| {
             let mut buf = BytesMut::with_capacity(64);
-            buf.describe_portal(Some(black_box("my_portal")));
+            buf.describe_portal(black_box("my_portal"));
         });
     });
 
     group.bench_function("statement", |b| {
         b.iter(|| {
             let mut buf = BytesMut::with_capacity(64);
-            buf.describe_statement(Some(black_box("my_stmt")));
+            buf.describe_statement(black_box("my_stmt"));
         });
     });
 
@@ -165,14 +166,14 @@ fn bench_put_execute(c: &mut Criterion) {
     group.bench_function("unlimited_rows", |b| {
         b.iter(|| {
             let mut buf = BytesMut::with_capacity(64);
-            buf.execute(Some(black_box("portal1")), black_box(0));
+            buf.execute(black_box("portal1"), black_box(0));
         });
     });
 
     group.bench_function("limited_rows", |b| {
         b.iter(|| {
             let mut buf = BytesMut::with_capacity(64);
-            buf.execute(Some(black_box("portal2")), black_box(100));
+            buf.execute(black_box("portal2"), black_box(100));
         });
     });
 
@@ -210,12 +211,10 @@ fn bench_chained_operations(c: &mut Criterion) {
     group.bench_function("parse_bind_execute_sync", |b| {
         b.iter(|| {
             let mut buf = BytesMut::with_capacity(256);
-            buf.parse(Some(black_box("stmt")))
-                .query(black_box("SELECT $1"))
-                .finish()
-                .bind(Some(black_box("stmt")))
+            buf.parse(black_box("stmt"), black_box("SELECT $1"), &[])
+                .bind(black_box("stmt"))
                 .finish(params!["42"])
-                .execute(None, black_box(0))
+                .execute("", black_box(0))
                 .sync();
         });
     });
@@ -224,21 +223,20 @@ fn bench_chained_operations(c: &mut Criterion) {
         let binary_data: &[u8] = &[1, 2, 3, 4];
         b.iter(|| {
             let mut buf = BytesMut::with_capacity(512);
-            buf.parse(Some(black_box("complex_stmt")))
-                .query(black_box(
-                    "SELECT * FROM table WHERE col1 = $1 AND col2 = $2",
-                ))
-                .param_types(&[oid::TEXT, oid::BYTEA])
-                .finish()
-                .describe_statement(Some(black_box("complex_stmt")))
-                .bind(Some(black_box("my_portal")))
-                .statement(black_box("complex_stmt"))
-                .result_format(FormatCode::Binary)
-                .finish(params!["value1", binary_data])
-                .describe_portal(Some(black_box("my_portal")))
-                .execute(Some(black_box("my_portal")), black_box(50))
-                .close_portal(Some(black_box("my_portal")))
-                .sync();
+            buf.parse(
+                black_box("complex_stmt"),
+                black_box("SELECT * FROM table WHERE col1 = $1 AND col2 = $2"),
+                &[oid::TEXT, oid::BYTEA],
+            )
+            .describe_statement(black_box("complex_stmt"))
+            .bind(black_box("my_portal"))
+            .statement(black_box("complex_stmt"))
+            .result_format(FormatCode::Binary)
+            .finish(params!["value1", binary_data])
+            .describe_portal(black_box("my_portal"))
+            .execute(black_box("my_portal"), black_box(50))
+            .close_portal(black_box("my_portal"))
+            .sync();
         });
     });
 

@@ -8,8 +8,8 @@
 //!
 //! The crate is organized around a few core concepts:
 //!
-//! - **Connection establishment** via [`ConnectionBuilder`] with support for
-//!   authentication and TLS
+//! - **Connection establishment** via `startup::ConnectionBuilder` with support
+//!   for authentication and TLS
 //! - **Message construction** using the [`PgProtocol`] extension trait on any buffer
 //! - **Frame reading** from backend responses via [`PgConnection`]
 //!
@@ -50,16 +50,14 @@
 //! # use pg_stream::message::oid;
 //! # async fn example(mut conn: PgConnection<tokio::net::TcpStream>) -> std::io::Result<()> {
 //! // Parse a prepared statement
-//! conn.parse(Some("stmt"))
-//!     .query("SELECT $1::int")
-//!     .param_types(&[oid::INT4])
-//!     .finish();
+//! conn.parse("stmt", "SELECT $1::int", &[oid::INT4]);
 //! conn.flush().await?;
 //!
-//! // Bind and execute
-//! conn.bind(Some("stmt"))
+//! // Bind and execute (empty names select the unnamed statement/portal)
+//! conn.bind("")
+//!     .statement("stmt")
 //!     .finish(params![42i32])
-//!     .execute(None, 0)
+//!     .execute("", 0)
 //!     .sync();
 //! conn.flush().await?;
 //! # Ok(())

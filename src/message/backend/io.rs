@@ -209,7 +209,6 @@ pub struct MessageReader {
     // `buf` may include initialized spare bytes after a synchronous read.
     // Only `buf[..filled]` contains bytes received from the stream.
     buf: BytesMut,
-    #[cfg(feature = "sync")]
     filled: usize,
     limits: MessageLimits,
 }
@@ -218,7 +217,6 @@ impl Default for MessageReader {
     fn default() -> Self {
         Self {
             buf: BytesMut::new(),
-            #[cfg(feature = "sync")]
             filled: 0,
             limits: MessageLimits::default(),
         }
@@ -228,7 +226,7 @@ impl Default for MessageReader {
 impl fmt::Debug for MessageReader {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MessageReader")
-            .field("buffered_len", &self.filled_len())
+            .field("buffered_len", &self.filled)
             .field("capacity", &self.buf.capacity())
             .field("limits", &self.limits)
             .finish()
@@ -265,19 +263,16 @@ impl MessageReader {
     /// Creates a reader with custom limits and bytes already consumed from a
     /// stream.
     pub fn from_buffer_with_limits(buf: BytesMut, limits: MessageLimits) -> Self {
-        #[cfg(feature = "sync")]
-        let filled = buf.len();
         Self {
+            filled: buf.len(),
             buf,
-            #[cfg(feature = "sync")]
-            filled,
             limits,
         }
     }
 
     /// Bytes buffered but not yet framed into a message.
     pub fn buffered(&self) -> &[u8] {
-        &self.buf[..self.filled_len()]
+        &self.buf[..self.filled]
     }
 
     /// Returns `true` if a full message is already buffered and can be framed
@@ -285,54 +280,28 @@ impl MessageReader {
     pub fn has_message(&self) -> bool {
         matches!(
             peek_frame_len(self.buffered()),
-            Some(frame_len) if self.filled_len() >= frame_len
+            Some(frame_len) if self.filled >= frame_len
         )
     }
 
     /// Consumes the reader, returning any buffered-but-unframed bytes.
     pub fn into_buffer(self) -> BytesMut {
-        #[cfg(feature = "sync")]
-        {
-            let mut buf = self.buf;
-            buf.truncate(self.filled);
-            buf
-        }
-        #[cfg(not(feature = "sync"))]
-        {
-            self.buf
-        }
-    }
-
-    #[inline]
-    fn filled_len(&self) -> usize {
-        #[cfg(feature = "sync")]
-        {
-            self.filled
-        }
-        #[cfg(not(feature = "sync"))]
-        {
-            self.buf.len()
-        }
+        let mut buf = self.buf;
+        buf.truncate(self.filled);
+        buf
     }
 
     #[inline]
     fn try_parse_frame(&mut self) -> std::io::Result<Option<PgMessage>> {
-        #[cfg(feature = "sync")]
-        return try_parse_frame(&mut self.buf, &mut self.filled, self.limits);
-        #[cfg(not(feature = "sync"))]
-        {
-            let mut valid_len = self.buf.len();
-            try_parse_frame(&mut self.buf, &mut valid_len, self.limits)
-        }
+        try_parse_frame(&mut self.buf, &mut self.filled, self.limits)
     }
 
     /// Returns the preferred size of the next read. A known frame is requested
     /// in full; its length is already bounded by [`MessageLimits`].
     #[inline]
     fn read_size_hint(&self) -> usize {
-        let filled = self.filled_len();
         match peek_frame_len(self.buffered()) {
-            Some(frame_len) => frame_len.saturating_sub(filled).max(1),
+            Some(frame_len) => frame_len.saturating_sub(self.filled).max(1),
             None => DEFAULT_READ_SIZE,
         }
     }
@@ -351,24 +320,15 @@ impl MessageReader {
             }
 
             let hint = self.read_size_hint();
-            let filled = self.filled_len();
-            let read = if filled < self.buf.len() {
-                let end = (filled + hint).min(self.buf.len());
-                let read = stream.read(&mut self.buf[filled..end]).await?;
-                #[cfg(feature = "sync")]
-                {
-                    self.filled += read;
-                }
-                read
+            let read = if self.filled < self.buf.len() {
+                // Initialized spare left over from a short sync read.
+                let end = (self.filled + hint).min(self.buf.len());
+                stream.read(&mut self.buf[self.filled..end]).await?
             } else {
                 self.buf.reserve(hint);
-                let read = stream.read_buf(&mut self.buf).await?;
-                #[cfg(feature = "sync")]
-                {
-                    self.filled += read;
-                }
-                read
+                stream.read_buf(&mut self.buf).await?
             };
+            self.filled += read;
 
             if read == 0 {
                 return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));

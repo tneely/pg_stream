@@ -1,4 +1,4 @@
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::AsyncRead;
 
 use crate::{
     PgMessage,
@@ -13,7 +13,7 @@ pub(crate) async fn read_auth_message<S>(
     reader: &mut MessageReader,
 ) -> startup::Result<Authentication>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + Unpin,
 {
     loop {
         match reader.read_message(stream).await? {

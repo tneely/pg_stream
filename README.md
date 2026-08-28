@@ -38,14 +38,12 @@ async fn main() -> pg_stream::startup::Result<()> {
     println!("server version: {}", startup.parameters["server_version"]);
 
     // Extended query protocol with bound parameters.
-    conn.parse(Some("stmt"))
-        .query("SELECT $1::int + $2::int")
-        .param_types(&[oid::INT4, oid::INT4])
-        .finish()
-        .bind(Some("portal"))
+    // Empty names select the unnamed statement/portal.
+    conn.parse("stmt", "SELECT $1::int + $2::int", &[oid::INT4, oid::INT4])
+        .bind("portal")
         .statement("stmt")
         .finish(params![5i32, 10i32])
-        .execute(Some("portal"), 0)
+        .execute("portal", 0)
         .sync();
     conn.flush().await?;
 
@@ -79,7 +77,7 @@ let mut buf = BytesMut::new();
 let name = String::from("Ada");
 let blob: Vec<u8> = vec![0xde, 0xad];
 
-buf.bind(None)
+buf.bind("")
     .finish(params![42i32, &name, blob, Option::<i64>::None]);
 ```
 
@@ -144,8 +142,10 @@ ConnectionBuilder::new("user").auth(AuthenticationMode::OAuthBearer("ya29...".in
 
 Channel binding (`SCRAM-SHA-256-PLUS`) is selected automatically when the
 connection is over TLS and the closure passed to `connect_with_tls` returns the
-server certificate (see below). Over TLS without a certificate, the client sends
-the SCRAM downgrade-detection flag so a stripped-`PLUS` offer is caught.
+server certificate (see below). With a certificate in hand but only the
+non-`PLUS` mechanism offered, the client sends the SCRAM downgrade-detection
+flag (`y`) so a binding-capable server rejects a stripped-`PLUS` offer. Without
+the certificate the client is not binding-capable and flags `n`.
 
 ### GSSAPI / SSPI
 
@@ -217,7 +217,9 @@ let (conn, startup) = ConnectionBuilder::new("postgres")
 - One buffered read frames many messages; bodies are zero-copy slices
 - Frontend messages are size-computed and written in a single pass, no scratch buffers
 - Bind and function-call format codes are collapsed to the compact protocol form
-- Minimal dependencies (`bytes`, `tokio` io-util, and crypto only under `startup`)
+- Pure-Rust dependency tree: `bytes`, `tokio` (io-util only), and small crypto
+  crates (`sha2`, `hmac`, `md5`, `base64`, `getrandom`) only under `startup`.
+  No C toolchain required; cold builds take seconds.
 
 ## Testing
 

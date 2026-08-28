@@ -38,37 +38,32 @@ pub fn md5_password(username: &str, password: &str, salt: &[u8; 4]) -> BytesMut 
     let mut ctx = Context::new();
     ctx.consume(password.as_bytes());
     ctx.consume(username.as_bytes());
-    let inner_hash = ctx.finalize();
-
-    // Convert to hex string
-    let inner_hex = hex_encode(&inner_hash.0);
+    let inner_hex = hex_encode(&ctx.finalize().0);
 
     // Second hash: md5(inner_hex + salt)
     let mut ctx = Context::new();
-    ctx.consume(inner_hex.as_bytes());
+    ctx.consume(inner_hex);
     ctx.consume(salt);
-    let outer_hash = ctx.finalize();
+    let outer_hex = hex_encode(&ctx.finalize().0);
 
     // Final result: "md5" + hex(outer_hash) + null terminator
-    let outer_hex = hex_encode(&outer_hash.0);
-
     let mut msg = BytesMut::new();
     msg.put_u8(MessageCode::PASSWORD_MESSAGE.as_u8());
     frame(&mut msg, 4 + outer_hex.len(), |buf| {
         buf.put_slice(b"md5");
-        buf.put_slice(outer_hex.as_bytes());
+        buf.put_slice(&outer_hex);
         buf.put_u8(0);
     });
     msg
 }
 
-/// Encodes bytes as a lowercase hex string.
-fn hex_encode(bytes: &[u8]) -> String {
+/// Encodes an MD5 digest as lowercase hex.
+fn hex_encode(bytes: &[u8; 16]) -> [u8; 32] {
     const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
-    let mut result = String::with_capacity(bytes.len() * 2);
-    for &byte in bytes {
-        result.push(HEX_CHARS[(byte >> 4) as usize] as char);
-        result.push(HEX_CHARS[(byte & 0x0f) as usize] as char);
+    let mut result = [0u8; 32];
+    for (i, &byte) in bytes.iter().enumerate() {
+        result[i * 2] = HEX_CHARS[(byte >> 4) as usize];
+        result[i * 2 + 1] = HEX_CHARS[(byte & 0x0f) as usize];
     }
     result
 }
@@ -94,9 +89,10 @@ mod tests {
 
     #[test]
     fn test_hex_encode() {
-        assert_eq!(hex_encode(&[0x00]), "00");
-        assert_eq!(hex_encode(&[0xff]), "ff");
-        assert_eq!(hex_encode(&[0xde, 0xad, 0xbe, 0xef]), "deadbeef");
+        let mut digest = [0u8; 16];
+        digest[..4].copy_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+        digest[15] = 0xff;
+        assert_eq!(&hex_encode(&digest), b"deadbeef0000000000000000000000ff");
     }
 
     #[test]

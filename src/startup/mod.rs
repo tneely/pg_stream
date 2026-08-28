@@ -172,7 +172,7 @@ pub struct StartupResponse {
 pub struct ConnectionBuilder {
     auth: AuthenticationMode,
     protocol: ProtocolVersion,
-    options: HashMap<String, String>,
+    options: Vec<(String, String)>,
     message_limits: MessageLimits,
 }
 
@@ -183,15 +183,14 @@ impl ConnectionBuilder {
     pub fn new(user: impl Into<String>) -> Self {
         let user = user.into();
 
-        let mut options = HashMap::new();
-        options.insert("application_name".into(), "pg_stream".into());
-        options.insert("database".into(), user.clone());
-        options.insert("user".into(), user);
-
         Self {
             auth: AuthenticationMode::Trust,
             protocol: CURRENT_VERSION,
-            options,
+            options: vec![
+                ("application_name".into(), "pg_stream".into()),
+                ("database".into(), user.clone()),
+                ("user".into(), user),
+            ],
             message_limits: MessageLimits::default(),
         }
     }
@@ -233,14 +232,21 @@ impl ConnectionBuilder {
         self
     }
 
-    /// Adds a startup parameter option.
+    /// Adds a startup parameter option, replacing any existing value.
     pub fn add_option(mut self, key: impl Into<String>, val: impl Into<String>) -> Self {
-        self.options.insert(key.into(), val.into());
+        let (key, val) = (key.into(), val.into());
+        match self.options.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, v)) => *v = val,
+            None => self.options.push((key, val)),
+        }
         self
     }
 
     fn get_user(&self) -> &str {
-        self.options.get("user").expect("user should always be set")
+        self.options
+            .iter()
+            .find_map(|(k, v)| (k == "user").then_some(v.as_str()))
+            .expect("user should always be set")
     }
 
     fn as_startup_message(&self) -> Bytes {
@@ -291,15 +297,14 @@ impl ConnectionBuilder {
 
         let mut buf = [0; 1];
         stream.read_exact(&mut buf).await?;
-        let res = u8::from_be_bytes(buf);
 
         const SSL_SUCCESS: u8 = b'S';
         const SSL_FAILURE: u8 = b'N';
 
-        let (stream, cert_der) = match res {
+        let (stream, cert_der) = match buf[0] {
             SSL_SUCCESS => upgrade_fn(stream).await?,
             SSL_FAILURE => Err(Error::TlsUnsupported)?,
-            _ => Err(format!("unexpected SSL response code '{res}'"))?,
+            other => Err(format!("unexpected SSL response code '{other}'"))?,
         };
 
         let cert_hash = match cert_der {
@@ -310,8 +315,7 @@ impl ConnectionBuilder {
             None => None,
         };
 
-        self.establish(stream, Tls::Active { cert_hash }, None)
-            .await
+        self.establish(stream, cert_hash, None).await
     }
 
     /// Establishes a Postgres connection over the provided stream.
@@ -322,7 +326,7 @@ impl ConnectionBuilder {
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
-        self.establish(stream, Tls::None, None).await
+        self.establish(stream, None, None).await
     }
 
     /// Establishes a connection using GSSAPI/SSPI authentication.
@@ -340,20 +344,22 @@ impl ConnectionBuilder {
         G: GssProvider,
     {
         let mut adapter = GssAdapter(provider);
-        self.establish(stream, Tls::None, Some(&mut adapter)).await
+        self.establish(stream, None, Some(&mut adapter)).await
     }
 
+    /// `cert_hash` is the `tls-server-end-point` binding data when connected
+    /// over TLS with the server certificate in hand.
     async fn establish<S>(
         &self,
         mut stream: S,
-        tls: Tls,
+        cert_hash: Option<Vec<u8>>,
         gss: Option<&mut dyn GssStep>,
     ) -> Result<(PgConnection<S>, StartupResponse)>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
         let mut reader = MessageReader::with_limits(self.message_limits);
-        self.authenticate(&mut stream, &mut reader, &tls, gss)
+        self.authenticate(&mut stream, &mut reader, cert_hash, gss)
             .await?;
 
         let mut startup_res = StartupResponse::default();
@@ -393,7 +399,7 @@ impl ConnectionBuilder {
         &self,
         stream: &mut S,
         reader: &mut MessageReader,
-        tls: &Tls,
+        cert_hash: Option<Vec<u8>>,
         gss: Option<&mut dyn GssStep>,
     ) -> Result<()>
     where
@@ -415,7 +421,7 @@ impl ConnectionBuilder {
                 let msg = md5_password(self.get_user(), pw, &salt);
                 self.send_and_expect_ok(stream, reader, &msg).await
             }
-            Authentication::Sasl(mechs) => self.sasl(stream, reader, &mechs, tls).await,
+            Authentication::Sasl(mechs) => self.sasl(stream, reader, &mechs, cert_hash).await,
             Authentication::Gss | Authentication::Sspi => {
                 let gss = gss.ok_or(Error::GssUnavailable)?;
                 self.gss_loop(stream, reader, gss, &[]).await
@@ -431,7 +437,7 @@ impl ConnectionBuilder {
         stream: &mut S,
         reader: &mut MessageReader,
         offered: &[u8],
-        tls: &Tls,
+        cert_hash: Option<Vec<u8>>,
     ) -> Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin,
@@ -452,7 +458,7 @@ impl ConnectionBuilder {
         }
 
         let pw = self.password()?;
-        let binding = select_channel_binding(tls.cert_hash(), &mechs)?;
+        let binding = select_channel_binding(cert_hash, &mechs)?;
 
         self.scram(stream, reader, pw, binding).await
     }
@@ -481,18 +487,13 @@ impl ConnectionBuilder {
         else {
             return Err("expected SASLContinue".to_string())?;
         };
-        let server_first = String::from_utf8(server_first.to_vec())
+        let server_first = std::str::from_utf8(&server_first)
             .map_err(|e| format!("SCRAM server-first message is not UTF-8: {e}"))?;
-        let runtime = tokio::runtime::Handle::try_current()
-            .map_err(|e| Error::Unexpected(format!("SCRAM requires a Tokio runtime: {e}")))?;
-        let (scram, client_final) = runtime
-            .spawn_blocking(move || {
-                let client_final = scram.client_final(&server_first)?;
-                Ok::<_, crate::auth::ScramError>((scram, client_final))
-            })
-            .await
-            .map_err(|e| Error::Unexpected(format!("SCRAM derivation task failed: {e}")))?
-            .map_err(|e| Error::Unexpected(format!("SCRAM handshake failed: {e}")))?;
+        // PBKDF2 runs inline: ~1ms at PostgreSQL's default 4096 iterations,
+        // bounded by MAX_SCRAM_ITERATIONS. Wrap connect() if that matters.
+        let client_final = scram
+            .client_final(server_first)
+            .map_err(|e| format!("SCRAM handshake failed: {e}"))?;
 
         self.send(stream, &sasl_response(client_final.as_bytes()))
             .await?;
@@ -507,7 +508,7 @@ impl ConnectionBuilder {
             .verify_server(server_final)
             .map_err(|e| format!("scram handshake failed: {e}"))?;
 
-        self.expect_ok(reader, stream).await
+        self.expect_ok(stream, reader).await
     }
 
     /// RFC 7628 OAUTHBEARER: send the bearer token; on a server error challenge,
@@ -591,12 +592,12 @@ impl ConnectionBuilder {
         S: AsyncRead + AsyncWrite + Unpin,
     {
         self.send(stream, msg).await?;
-        self.expect_ok(reader, stream).await
+        self.expect_ok(stream, reader).await
     }
 
-    async fn expect_ok<S>(&self, reader: &mut MessageReader, stream: &mut S) -> Result<()>
+    async fn expect_ok<S>(&self, stream: &mut S, reader: &mut MessageReader) -> Result<()>
     where
-        S: AsyncRead + AsyncWrite + Unpin,
+        S: AsyncRead + Unpin,
     {
         match read_auth_message(stream, reader).await? {
             Authentication::Ok => Ok(()),
@@ -607,38 +608,18 @@ impl ConnectionBuilder {
 
 /// Picks the SCRAM channel binding for a server's offered mechanisms. Only a
 /// supplied certificate makes the client binding-capable, so `y` requires one.
-fn select_channel_binding(cert_hash: Option<&[u8]>, mechs: &[&str]) -> Result<ChannelBinding> {
+fn select_channel_binding(cert_hash: Option<Vec<u8>>, mechs: &[&str]) -> Result<ChannelBinding> {
     let has_plus = mechs.contains(&"SCRAM-SHA-256-PLUS");
     let has_plain = mechs.contains(&"SCRAM-SHA-256");
 
     match (cert_hash, has_plus, has_plain) {
-        (Some(hash), true, _) => Ok(ChannelBinding::TlsServerEndPoint(hash.to_vec())),
+        (Some(hash), true, _) => Ok(ChannelBinding::TlsServerEndPoint(hash)),
         (Some(_), false, true) => Ok(ChannelBinding::NotUsed),
         (None, _, true) => Ok(ChannelBinding::NotSupported),
         (None, true, false) => Err(Error::ChannelBindingRequired),
         _ => Err(Error::Unexpected(format!(
             "no supported SASL mechanism offered: {mechs:?}"
         ))),
-    }
-}
-
-/// TLS state used to select a SCRAM channel-binding mechanism.
-enum Tls {
-    /// Plaintext connection.
-    None,
-    /// TLS connection, with the `tls-server-end-point` hash if the caller
-    /// supplied the server certificate.
-    Active { cert_hash: Option<Vec<u8>> },
-}
-
-impl Tls {
-    fn cert_hash(&self) -> Option<&[u8]> {
-        match self {
-            Tls::Active {
-                cert_hash: Some(h), ..
-            } => Some(h),
-            _ => None,
-        }
     }
 }
 
@@ -767,17 +748,17 @@ mod tests {
     fn test_channel_binding_selection() {
         const PLUS: &str = "SCRAM-SHA-256-PLUS";
         const PLAIN: &str = "SCRAM-SHA-256";
-        let hash = [0xABu8; 32];
+        let hash = vec![0xABu8; 32];
 
         // Cert available and PLUS offered: bind to the certificate.
         assert_eq!(
-            select_channel_binding(Some(&hash), &[PLAIN, PLUS]).unwrap(),
-            ChannelBinding::TlsServerEndPoint(hash.to_vec())
+            select_channel_binding(Some(hash.clone()), &[PLAIN, PLUS]).unwrap(),
+            ChannelBinding::TlsServerEndPoint(hash.clone())
         );
 
         // Cert available but PLUS stripped: flag the downgrade.
         assert_eq!(
-            select_channel_binding(Some(&hash), &[PLAIN]).unwrap(),
+            select_channel_binding(Some(hash), &[PLAIN]).unwrap(),
             ChannelBinding::NotUsed
         );
 
