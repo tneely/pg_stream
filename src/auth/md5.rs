@@ -1,71 +1,18 @@
 //! MD5 password authentication.
-//!
-//! PostgreSQL's MD5 authentication uses a double-hash scheme:
-//! `md5(md5(password + username) + salt)`
-//!
-//! The result is sent as the string "md5" followed by the hex-encoded hash.
 
-use bytes::{BufMut, BytesMut};
 use md5::Context;
 
-use crate::message::frontend::{MessageCode, frame};
+/// Computes the response to an AuthenticationMD5Password request:
+/// `"md5" + md5(md5(password + user) + salt)`, with both digests in hex.
+pub fn md5_password(user: &str, password: &str, salt: [u8; 4]) -> String {
+    let mut inner = Context::new();
+    inner.consume(password);
+    inner.consume(user);
 
-/// Computes the MD5 password hash for Postgres authentication.
-///
-/// The hash is computed as: `md5(md5(password + username) + salt)`
-///
-/// # Arguments
-///
-/// * `username` - The database username
-/// * `password` - The user's password
-/// * `salt` - The 4-byte salt provided by the server
-///
-/// # Returns
-///
-/// A `BytesMut` containing the password message ready to be sent.
-///
-/// # Example
-///
-/// ```rust
-/// use pg_stream::auth::md5_password;
-///
-/// let salt = [0x12, 0x34, 0x56, 0x78];
-/// let msg = md5_password("postgres", "secret", &salt);
-/// // Send msg to the server
-/// ```
-pub fn md5_password(username: &str, password: &str, salt: &[u8; 4]) -> BytesMut {
-    // First hash: md5(password + username)
-    let mut ctx = Context::new();
-    ctx.consume(password.as_bytes());
-    ctx.consume(username.as_bytes());
-    let inner_hex = hex_encode(&ctx.finalize().0);
-
-    // Second hash: md5(inner_hex + salt)
-    let mut ctx = Context::new();
-    ctx.consume(inner_hex);
-    ctx.consume(salt);
-    let outer_hex = hex_encode(&ctx.finalize().0);
-
-    // Final result: "md5" + hex(outer_hash) + null terminator
-    let mut msg = BytesMut::new();
-    msg.put_u8(MessageCode::PASSWORD_MESSAGE.as_u8());
-    frame(&mut msg, 4 + outer_hex.len(), |buf| {
-        buf.put_slice(b"md5");
-        buf.put_slice(&outer_hex);
-        buf.put_u8(0);
-    });
-    msg
-}
-
-/// Encodes an MD5 digest as lowercase hex.
-fn hex_encode(bytes: &[u8; 16]) -> [u8; 32] {
-    const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
-    let mut result = [0u8; 32];
-    for (i, &byte) in bytes.iter().enumerate() {
-        result[i * 2] = HEX_CHARS[(byte >> 4) as usize];
-        result[i * 2 + 1] = HEX_CHARS[(byte & 0x0f) as usize];
-    }
-    result
+    let mut outer = Context::new();
+    outer.consume(format!("{:x}", inner.finalize()));
+    outer.consume(salt);
+    format!("md5{:x}", outer.finalize())
 }
 
 #[cfg(test)]
@@ -73,40 +20,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_md5_password() {
-        // Known test vector
-        let salt = [0x8b, 0x60, 0x4c, 0x73];
-        let msg = md5_password("postgres", "password", &salt);
+    fn hashes_the_password_then_the_salt() {
+        let hashed = md5_password("postgres", "password", [0x8b, 0x60, 0x4c, 0x73]);
+        assert_eq!(hashed.len(), 35);
 
-        // Check message code
-        assert_eq!(msg[0], b'p');
+        let inner = format!("{:x}", md5::compute("passwordpostgres"));
+        assert_eq!(inner, "32e12f215ba27cb750c9e093ce4b5127");
 
-        // Extract the password string (after code + length)
-        let password_str = String::from_utf8_lossy(&msg[5..msg.len() - 1]);
-        assert!(password_str.starts_with("md5"));
-        assert_eq!(password_str.len(), 35); // "md5" + 32 hex chars
+        let mut salted = inner.into_bytes();
+        salted.extend_from_slice(&[0x8b, 0x60, 0x4c, 0x73]);
+        assert_eq!(hashed, format!("md5{:x}", md5::compute(salted)));
     }
 
     #[test]
-    fn test_hex_encode() {
-        let mut digest = [0u8; 16];
-        digest[..4].copy_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
-        digest[15] = 0xff;
-        assert_eq!(&hex_encode(&digest), b"deadbeef0000000000000000000000ff");
-    }
-
-    #[test]
-    fn test_known_md5_hash() {
-        // Test with known values from PostgreSQL
-        // User: "postgres", Password: "password", Salt: [0, 0, 0, 0]
-        let salt = [0x00, 0x00, 0x00, 0x00];
-        let msg = md5_password("postgres", "password", &salt);
-
-        // The result should be "md5" followed by a specific hash
-        let password_str = String::from_utf8_lossy(&msg[5..msg.len() - 1]);
-
-        // First hash: md5("passwordpostgres") = "2e7dc6f8...""
-        // Second hash: md5(first_hash_hex + salt)
-        assert!(password_str.starts_with("md5"));
+    fn depends_on_every_input() {
+        let base = md5_password("user", "pw", [1, 2, 3, 4]);
+        assert_ne!(base, md5_password("other", "pw", [1, 2, 3, 4]));
+        assert_ne!(base, md5_password("user", "other", [1, 2, 3, 4]));
+        assert_ne!(base, md5_password("user", "pw", [4, 3, 2, 1]));
     }
 }

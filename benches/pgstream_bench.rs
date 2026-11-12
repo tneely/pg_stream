@@ -1,516 +1,391 @@
-use std::hint::black_box;
-
-use bytes::BytesMut;
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-
-use pg_stream::{
-    PgProtocol,
-    message::{FormatCode, MessageReader, PgMessage, oid},
-    params,
+use std::{
+    hint::black_box,
+    io::{self, Read, Write},
 };
 
-fn bench_put_query(c: &mut Criterion) {
-    let mut group = c.benchmark_group("put_query");
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use pg_stream::{
+    Blocking, Connection, Format, Frontend, Message, backend::RowDescription, block_on,
+    frontend::params_with, oid, params,
+};
 
-    let queries = vec![
-        ("short", "SELECT 1"),
-        (
-            "medium",
-            "SELECT * FROM users WHERE id = 1 AND status = 'active'",
-        ),
-        (
-            "long",
-            "SELECT u.id, u.name, u.email, o.order_id, o.total FROM users u JOIN orders o ON u.id = o.user_id WHERE u.created_at > '2024-01-01' AND o.status IN ('pending', 'completed') ORDER BY o.created_at DESC LIMIT 100",
-        ),
-    ];
+/// A server that has already said everything it is going to say.
+struct Replay<'a>(&'a [u8]);
 
-    for (name, query) in queries {
-        group.bench_with_input(BenchmarkId::from_parameter(name), &query, |b, &query| {
-            b.iter(|| {
-                let mut buf = BytesMut::with_capacity(256);
-                buf.query(black_box(query));
-            });
-        });
+impl Read for Replay<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.0.read(buf)
+    }
+}
+
+impl Write for Replay<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        Ok(buf.len())
     }
 
-    group.finish();
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
-fn bench_put_parse(c: &mut Criterion) {
-    let mut group = c.benchmark_group("put_parse");
-
-    let param_types_small: &[u32] = &[];
-    let param_types_medium: &[u32] = &[oid::INT4, oid::TEXT, oid::TIMESTAMP];
-    let param_types_large: &[u32] = &[
-        oid::INT4,
-        oid::INT8,
-        oid::TEXT,
-        oid::VARCHAR,
-        oid::TIMESTAMP,
-        oid::BOOL,
-        oid::FLOAT4,
-        oid::FLOAT8,
-        oid::NUMERIC,
-        oid::BYTEA,
-    ];
-
-    group.bench_function("no_params", |b| {
-        b.iter(|| {
-            let mut buf = BytesMut::with_capacity(256);
-            buf.parse(
-                black_box("stmt1"),
-                black_box("SELECT * FROM users WHERE id = $1"),
-                black_box(param_types_small),
-            );
-        });
-    });
-
-    group.bench_function("three_params", |b| {
-        b.iter(|| {
-            let mut buf = BytesMut::with_capacity(256);
-            buf.parse(
-                black_box("stmt2"),
-                black_box("SELECT * FROM users WHERE id = $1 AND name = $2 AND created_at > $3"),
-                black_box(param_types_medium),
-            );
-        });
-    });
-
-    group.bench_function("ten_params", |b| {
-        b.iter(|| {
-            let mut buf = BytesMut::with_capacity(256);
-            buf.parse(
-                black_box("stmt3"),
-                black_box(
-                    "INSERT INTO large_table VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
-                ),
-                black_box(param_types_large),
-            );
-        });
-    });
-
-    group.finish();
+/// A server that says nothing until it is written to, and then gives the
+/// same reply every time.
+struct Answering<'a> {
+    reply: &'a [u8],
+    unread: &'a [u8],
 }
 
-fn bench_put_bind(c: &mut Criterion) {
-    let mut group = c.benchmark_group("put_bind");
-
-    group.bench_function("one_param_text_result", |b| {
-        b.iter(|| {
-            let mut buf = BytesMut::with_capacity(256);
-            buf.bind(black_box(""))
-                .statement(black_box(""))
-                .result_format(FormatCode::Text)
-                .finish(params!["42"]);
-        });
-    });
-
-    group.bench_function("three_params_binary_result", |b| {
-        let binary_data: &[u8] = &[1, 2, 3, 4];
-        b.iter(|| {
-            let mut buf = BytesMut::with_capacity(256);
-            buf.bind(black_box("portal1"))
-                .statement(black_box("stmt1"))
-                .result_format(FormatCode::Binary)
-                .finish(params!["42", "John Doe", binary_data]);
-        });
-    });
-
-    group.bench_function("eight_params_mixed", |b| {
-        let binary1: &[u8] = &[1, 2, 3, 4, 5, 6, 7, 8];
-        let binary2: &[u8] = &[9, 10, 11, 12];
-        let none: Option<i32> = None;
-        b.iter(|| {
-            let mut buf = BytesMut::with_capacity(256);
-            buf.bind(black_box("portal2"))
-                .statement(black_box("stmt2"))
-                .finish(params![
-                    "1",
-                    "2",
-                    binary1,
-                    "test",
-                    binary2,
-                    "more data",
-                    none,
-                    "final"
-                ]);
-        });
-    });
-
-    group.finish();
+impl<'a> Answering<'a> {
+    fn new(reply: &'a [u8]) -> Self {
+        Self { reply, unread: &[] }
+    }
 }
 
-fn bench_put_describe(c: &mut Criterion) {
-    let mut group = c.benchmark_group("put_describe");
-
-    group.bench_function("portal", |b| {
-        b.iter(|| {
-            let mut buf = BytesMut::with_capacity(64);
-            buf.describe_portal(black_box("my_portal"));
-        });
-    });
-
-    group.bench_function("statement", |b| {
-        b.iter(|| {
-            let mut buf = BytesMut::with_capacity(64);
-            buf.describe_statement(black_box("my_stmt"));
-        });
-    });
-
-    group.finish();
+impl Read for Answering<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.unread.read(buf)
+    }
 }
 
-fn bench_put_execute(c: &mut Criterion) {
-    let mut group = c.benchmark_group("put_execute");
+impl Write for Answering<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.unread = self.reply;
+        Ok(buf.len())
+    }
 
-    group.bench_function("unlimited_rows", |b| {
-        b.iter(|| {
-            let mut buf = BytesMut::with_capacity(64);
-            buf.execute(black_box("portal1"), black_box(0));
-        });
-    });
-
-    group.bench_function("limited_rows", |b| {
-        b.iter(|| {
-            let mut buf = BytesMut::with_capacity(64);
-            buf.execute(black_box("portal2"), black_box(100));
-        });
-    });
-
-    group.finish();
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
-fn bench_put_fn_call(c: &mut Criterion) {
-    let mut group = c.benchmark_group("put_fn_call");
-
-    group.bench_function("one_arg_text_result", |b| {
-        b.iter(|| {
-            let mut buf = BytesMut::with_capacity(64);
-            buf.fn_call(black_box(12345))
-                .result_format(FormatCode::Text)
-                .finish(params!["arg1"]);
-        });
-    });
-
-    group.bench_function("three_args_binary_result", |b| {
-        let binary_data: &[u8] = &[1, 2, 3, 4];
-        b.iter(|| {
-            let mut buf = BytesMut::with_capacity(64);
-            buf.fn_call(black_box(67890))
-                .result_format(FormatCode::Binary)
-                .finish(params!["arg1", binary_data, "arg3"]);
-        });
-    });
-
-    group.finish();
+fn frame(wire: &mut Vec<u8>, code: u8, body: &[u8]) {
+    wire.push(code);
+    wire.extend_from_slice(&(body.len() as u32 + 4).to_be_bytes());
+    wire.extend_from_slice(body);
 }
 
-fn bench_chained_operations(c: &mut Criterion) {
-    let mut group = c.benchmark_group("chained_operations");
+/// The body of a RowDescription of `columns` text columns.
+fn description(columns: u16) -> Vec<u8> {
+    let mut body = columns.to_be_bytes().to_vec();
+    for column in 0..columns {
+        body.extend_from_slice(format!("column_{column}\0").as_bytes());
+        body.extend_from_slice(&[0; 18]);
+    }
+    body
+}
+
+/// The body of a DataRow of `columns` values, each of them `value`.
+fn row(columns: u16, value: &[u8]) -> Vec<u8> {
+    let mut body = columns.to_be_bytes().to_vec();
+    for _ in 0..columns {
+        body.extend_from_slice(&(value.len() as u32).to_be_bytes());
+        body.extend_from_slice(value);
+    }
+    body
+}
+
+/// The reply to a simple query returning `rows` rows of `columns` short text
+/// columns.
+fn result_set(rows: usize, columns: u16) -> Vec<u8> {
+    let row = row(columns, b"a value!");
+    let mut wire = Vec::new();
+    frame(&mut wire, b'T', &description(columns));
+    (0..rows).for_each(|_| frame(&mut wire, b'D', &row));
+    frame(&mut wire, b'C', format!("SELECT {rows}\0").as_bytes());
+    frame(&mut wire, b'Z', b"I");
+    wire
+}
+
+/// Queues one cycle of the extended protocol: a row looked up by its id.
+fn lookup(to: &mut impl Frontend, id: i32) {
+    to.bind("", "by_id", params![id], Format::Binary);
+    to.execute("", 0).sync();
+}
+
+fn encode(c: &mut Criterion) {
+    let mut group = c.benchmark_group("encode");
+    let mut buf = Vec::with_capacity(4096);
+
+    group.bench_function("query", |b| {
+        b.iter(|| {
+            buf.clear();
+            buf.query(black_box(
+                "SELECT * FROM users WHERE id = 1 AND status = 'active'",
+            ));
+        })
+    });
 
     group.bench_function("parse_bind_execute_sync", |b| {
         b.iter(|| {
-            let mut buf = BytesMut::with_capacity(256);
-            buf.parse(black_box("stmt"), black_box("SELECT $1"), &[])
-                .bind(black_box("stmt"))
-                .finish(params!["42"])
-                .execute("", black_box(0))
+            buf.clear();
+            buf.parse(black_box(""), black_box("SELECT $1"), &[])
+                .bind("", "", params!["42"], Format::Text)
+                .execute("", 0)
                 .sync();
-        });
+        })
     });
 
-    group.bench_function("complex_extended_query", |b| {
-        let binary_data: &[u8] = &[1, 2, 3, 4];
+    group.bench_function("bind_eight_mixed_params", |b| {
+        let blob: &[u8] = &[1, 2, 3, 4, 5, 6, 7, 8];
+        let values = params![
+            "1",
+            2i32,
+            blob,
+            "test",
+            5i64,
+            "more data",
+            None::<i32>,
+            true
+        ];
         b.iter(|| {
-            let mut buf = BytesMut::with_capacity(512);
+            buf.clear();
+            buf.bind(
+                black_box("portal"),
+                black_box("statement"),
+                values,
+                Format::Binary,
+            );
+        })
+    });
+
+    group.bench_function("bind_eight_binary_params_streamed", |b| {
+        let ids = [1i64, 2, 3, 4, 5, 6, 7, 8];
+        b.iter(|| {
+            buf.clear();
+            let values = params_with(Format::Binary, |values| {
+                for id in black_box(ids) {
+                    values.write(|buf| buf.extend_from_slice(&id.to_be_bytes()));
+                }
+            });
+            buf.bind("portal", "statement", values, Format::Binary);
+        })
+    });
+
+    // The same messages written into a slice, which cannot grow.
+    let mut storage = vec![0; 4096];
+
+    group.bench_function("query_into_slice", |b| {
+        b.iter(|| {
+            let mut buf = &mut storage[..];
+            buf.query(black_box(
+                "SELECT * FROM users WHERE id = 1 AND status = 'active'",
+            ));
+            black_box(buf.len());
+        })
+    });
+
+    group.bench_function("parse_bind_execute_sync_into_slice", |b| {
+        b.iter(|| {
+            let mut buf = &mut storage[..];
+            buf.parse(black_box(""), black_box("SELECT $1"), &[])
+                .bind("", "", params!["42"], Format::Text)
+                .execute("", 0)
+                .sync();
+            black_box(buf.len());
+        })
+    });
+
+    group.bench_function("bind_eight_mixed_params_into_slice", |b| {
+        let blob: &[u8] = &[1, 2, 3, 4, 5, 6, 7, 8];
+        let values = params![
+            "1",
+            2i32,
+            blob,
+            "test",
+            5i64,
+            "more data",
+            None::<i32>,
+            true
+        ];
+        b.iter(|| {
+            let mut buf = &mut storage[..];
+            buf.bind(
+                black_box("portal"),
+                black_box("statement"),
+                values,
+                Format::Binary,
+            );
+            black_box(buf.len());
+        })
+    });
+
+    group.bench_function("prepare_describe_execute_close", |b| {
+        b.iter(|| {
+            buf.clear();
             buf.parse(
-                black_box("complex_stmt"),
-                black_box("SELECT * FROM table WHERE col1 = $1 AND col2 = $2"),
-                &[oid::TEXT, oid::BYTEA],
+                "stmt",
+                black_box("SELECT * FROM t WHERE a = $1 AND b = $2"),
+                &[oid::TEXT],
             )
-            .describe_statement(black_box("complex_stmt"))
-            .bind(black_box("my_portal"))
-            .statement(black_box("complex_stmt"))
-            .result_format(FormatCode::Binary)
-            .finish(params!["value1", binary_data])
-            .describe_portal(black_box("my_portal"))
-            .execute(black_box("my_portal"), black_box(50))
-            .close_portal(black_box("my_portal"))
+            .describe_statement("stmt")
+            .bind("portal", "stmt", params!["value", 7i32], Format::Binary)
+            .describe_portal("portal")
+            .execute("portal", 50)
+            .close_portal("portal")
             .sync();
-        });
-    });
-
-    group.finish();
-}
-
-fn bench_read_message(c: &mut Criterion) {
-    let mut group = c.benchmark_group("read_message");
-    let rt = tokio::runtime::Runtime::new().unwrap();
-
-    fn create_frame(code: u8, body: &[u8]) -> Vec<u8> {
-        let mut buf = Vec::new();
-        buf.push(code);
-        buf.extend_from_slice(&((body.len() + 4) as u32).to_be_bytes());
-        buf.extend_from_slice(body);
-        buf
-    }
-
-    async fn read_one(reader: &mut MessageReader, frame: &[u8]) -> PgMessage {
-        let mut stream = frame;
-        reader.read_message(&mut stream).await.unwrap()
-    }
-
-    let ready_for_query = create_frame(b'Z', b"I");
-    group.bench_function("ready_for_query_idle", |b| {
-        let mut reader = MessageReader::new();
-        b.iter(|| {
-            rt.block_on(async {
-                let stream = black_box(ready_for_query.as_slice());
-                read_one(&mut reader, stream).await
-            })
-        })
-    });
-
-    let command_complete = create_frame(b'C', b"SELECT 1\0");
-    group.bench_function("command_complete_select", |b| {
-        let mut reader = MessageReader::new();
-        b.iter(|| {
-            rt.block_on(async {
-                let stream = black_box(command_complete.as_slice());
-                read_one(&mut reader, stream).await
-            })
-        })
-    });
-
-    let mut parameter_status_body = Vec::new();
-    parameter_status_body.extend_from_slice(b"server_version");
-    parameter_status_body.push(0);
-    parameter_status_body.extend_from_slice(b"16.0");
-    parameter_status_body.push(0);
-    let parameter_status = create_frame(b'S', &parameter_status_body);
-    group.bench_function("parameter_status", |b| {
-        let mut reader = MessageReader::new();
-        b.iter(|| {
-            rt.block_on(async {
-                let stream = black_box(parameter_status.as_slice());
-                read_one(&mut reader, stream).await
-            })
-        })
-    });
-
-    let mut backend_key_data_body = Vec::new();
-    backend_key_data_body.extend_from_slice(&12345_u32.to_be_bytes());
-    backend_key_data_body.extend_from_slice(&[0xAB; 32]); // 3.2-length secret key
-    let backend_key_data = create_frame(b'K', &backend_key_data_body);
-    group.bench_function("backend_key_data", |b| {
-        let mut reader = MessageReader::new();
-        b.iter(|| {
-            rt.block_on(async {
-                let stream = black_box(backend_key_data.as_slice());
-                read_one(&mut reader, stream).await
-            })
-        })
-    });
-
-    let mut row_description_body = Vec::new();
-    row_description_body.extend_from_slice(&1_u16.to_be_bytes());
-    row_description_body.extend_from_slice(b"id");
-    row_description_body.push(0);
-    row_description_body.extend_from_slice(&0_u32.to_be_bytes());
-    row_description_body.extend_from_slice(&0_u16.to_be_bytes());
-    row_description_body.extend_from_slice(&23_u32.to_be_bytes());
-    row_description_body.extend_from_slice(&4_i16.to_be_bytes());
-    row_description_body.extend_from_slice(&(-1_i32).to_be_bytes());
-    row_description_body.extend_from_slice(&0_u16.to_be_bytes());
-    let row_description = create_frame(b'T', &row_description_body);
-    group.bench_function("row_description_single_column", |b| {
-        let mut reader = MessageReader::new();
-        b.iter(|| {
-            rt.block_on(async {
-                let stream = black_box(row_description.as_slice());
-                read_one(&mut reader, stream).await
-            })
-        })
-    });
-
-    let mut data_row_body = Vec::new();
-    data_row_body.extend_from_slice(&2_u16.to_be_bytes());
-    data_row_body.extend_from_slice(&5_i32.to_be_bytes());
-    data_row_body.extend_from_slice(b"hello");
-    data_row_body.extend_from_slice(&(-1_i32).to_be_bytes());
-    let data_row = create_frame(b'D', &data_row_body);
-    group.bench_function("data_row_two_columns", |b| {
-        let mut reader = MessageReader::new();
-        b.iter(|| {
-            rt.block_on(async {
-                let stream = black_box(data_row.as_slice());
-                read_one(&mut reader, stream).await
-            })
-        })
-    });
-
-    let mut error_response_body = Vec::new();
-    error_response_body.extend_from_slice(b"SERROR\0");
-    error_response_body.extend_from_slice(b"VERROR\0");
-    error_response_body.extend_from_slice(b"C42601\0");
-    error_response_body.extend_from_slice(b"Msyntax error at or near \"SELECT\"\0");
-    error_response_body.push(0);
-    let error_response = create_frame(b'E', &error_response_body);
-    group.bench_function("error_response", |b| {
-        let mut reader = MessageReader::new();
-        b.iter(|| {
-            rt.block_on(async {
-                let stream = black_box(error_response.as_slice());
-                read_one(&mut reader, stream).await
-            })
-        })
-    });
-
-    let copy_data_1kb = create_frame(b'd', &vec![b'x'; 1024]);
-    group.bench_function("copy_data_1kb", |b| {
-        let mut reader = MessageReader::new();
-        b.iter(|| {
-            rt.block_on(async {
-                let stream = black_box(copy_data_1kb.as_slice());
-                read_one(&mut reader, stream).await
-            })
-        })
-    });
-
-    let copy_data_100kb = create_frame(b'd', &vec![b'x'; 100 * 1024]);
-    group.bench_function("copy_data_100kb", |b| {
-        let mut reader = MessageReader::new();
-        b.iter(|| {
-            rt.block_on(async {
-                let stream = black_box(copy_data_100kb.as_slice());
-                read_one(&mut reader, stream).await
-            })
         })
     });
 
     group.finish();
 }
 
-/// Measures framing a stream of small messages with one persistent reader.
-fn bench_stream_reader(c: &mut Criterion) {
-    let mut group = c.benchmark_group("stream_reader");
-    let rt = tokio::runtime::Runtime::new().unwrap();
+fn receive(c: &mut Criterion) {
+    let mut group = c.benchmark_group("receive");
 
-    fn create_frame(code: u8, body: &[u8]) -> Vec<u8> {
-        let mut buf = Vec::new();
-        buf.push(code);
-        buf.extend_from_slice(&((body.len() + 4) as u32).to_be_bytes());
-        buf.extend_from_slice(body);
-        buf
-    }
+    for (name, rows, columns) in [("100_rows_x_1", 100, 1), ("1000_rows_x_10", 1000, 10)] {
+        let wire = result_set(rows, columns);
+        group.throughput(Throughput::Elements(rows as u64));
 
-    // A typical result stream: RowDescription, many DataRows, CommandComplete,
-    // ReadyForQuery, all delivered in one buffer.
-    let mut stream_bytes = Vec::new();
-    stream_bytes.extend_from_slice(&create_frame(b'T', &[0; 32]));
-    for _ in 0..100 {
-        stream_bytes.extend_from_slice(&create_frame(b'D', &[0, 1, 0, 0, 0, 2, b'4', b'2']));
-    }
-    stream_bytes.extend_from_slice(&create_frame(b'C', b"SELECT 100\0"));
-    stream_bytes.extend_from_slice(&create_frame(b'Z', b"I"));
-    let message_count = 103;
-
-    group.bench_function("buffered_reader_103_messages", |b| {
-        b.iter(|| {
-            rt.block_on(async {
-                let mut stream = black_box(stream_bytes.as_slice());
-                let mut reader = MessageReader::new();
-                for _ in 0..message_count {
-                    black_box(reader.read_message(&mut stream).await.unwrap());
+        group.bench_function(format!("recv/{name}"), |b| {
+            b.iter(|| {
+                let mut conn = Connection::new(Blocking(Replay(black_box(&wire))));
+                let mut values = 0;
+                loop {
+                    match block_on(conn.recv()).unwrap() {
+                        Message::DataRow(row) => values += row.iter().flatten().count(),
+                        Message::ReadyForQuery(_) => break values,
+                        _ => {}
+                    }
                 }
             })
+        });
+
+        group.bench_function(format!("response/{name}"), |b| {
+            b.iter(|| {
+                let mut conn = Connection::new(Blocking(Replay(black_box(&wire))));
+                block_on(async {
+                    let mut response = conn.response();
+                    response.row_description().await.unwrap();
+                    let mut values = 0;
+                    while let Some(row) = response.row().await.unwrap() {
+                        values += row.iter().flatten().count();
+                    }
+                    response.finish().await.unwrap();
+                    values
+                })
+            })
+        });
+
+        // The rows skipped rather than read.
+        group.bench_function(format!("finish/{name}"), |b| {
+            b.iter(|| {
+                let mut conn = Connection::new(Blocking(Replay(black_box(&wire))));
+                block_on(conn.response().finish()).unwrap()
+            })
+        });
+
+        group.bench_function(format!("recv_frame/{name}"), |b| {
+            b.iter(|| {
+                let mut conn = Connection::new(Blocking(Replay(black_box(&wire))));
+                let mut values = 0;
+                loop {
+                    let frame = block_on(conn.recv_frame()).unwrap();
+                    match frame.parse().unwrap() {
+                        Message::DataRow(row) => values += row.iter().flatten().count(),
+                        Message::ReadyForQuery(_) => break values,
+                        _ => {}
+                    }
+                }
+            })
+        });
+
+        group.bench_function(format!("recv_frames/{name}"), |b| {
+            b.iter(|| {
+                let mut conn = Connection::new(Blocking(Replay(black_box(&wire))));
+                let mut values = 0;
+                loop {
+                    let frames = block_on(conn.recv_frames()).unwrap();
+                    for message in frames.messages() {
+                        if let Message::DataRow(row) = message.unwrap() {
+                            values += row.iter().flatten().count();
+                        }
+                    }
+                    if frames.ends_cycle() {
+                        break values;
+                    }
+                }
+            })
+        });
+    }
+
+    let body = description(10);
+    group.throughput(Throughput::Elements(10));
+    group.bench_function("row_description/10_columns", |b| {
+        b.iter(|| {
+            let columns = RowDescription::parse(black_box(&body)).unwrap();
+            let names = columns.iter().map(|column| column.name.len());
+            names.sum::<usize>()
         })
     });
 
     group.finish();
 }
 
-fn bench_stream_reader_sync(c: &mut Criterion) {
-    #[cfg(feature = "sync")]
-    {
-        use std::io::Read;
+/// Queueing messages on a connection and writing them out, to a stream that
+/// takes everything it is given.
+fn send(c: &mut Criterion) {
+    let mut group = c.benchmark_group("send");
+    let mut conn = Connection::new(Blocking(Replay(&[])));
 
-        let mut group = c.benchmark_group("stream_reader_sync");
+    group.bench_function("bind_execute_sync", |b| {
+        b.iter(|| {
+            lookup(&mut conn, black_box(7));
+            block_on(conn.flush()).unwrap();
+        })
+    });
 
-        fn create_frame(code: u8, body: &[u8]) -> Vec<u8> {
-            let mut buf = Vec::new();
-            buf.push(code);
-            buf.extend_from_slice(&((body.len() + 4) as u32).to_be_bytes());
-            buf.extend_from_slice(body);
-            buf
-        }
+    group.throughput(Throughput::Elements(100));
+    group.bench_function("pipeline_of_100_cycles", |b| {
+        b.iter(|| {
+            (0..100).for_each(|id| lookup(&mut conn, black_box(id)));
+            block_on(conn.flush()).unwrap();
+        })
+    });
 
-        let mut stream_bytes = Vec::new();
-        stream_bytes.extend_from_slice(&create_frame(b'T', &[0; 32]));
-        for _ in 0..100 {
-            stream_bytes.extend_from_slice(&create_frame(b'D', &[0, 1, 0, 0, 0, 2, b'4', b'2']));
-        }
-        stream_bytes.extend_from_slice(&create_frame(b'C', b"SELECT 100\0"));
-        stream_bytes.extend_from_slice(&create_frame(b'Z', b"I"));
-
-        struct ChunkedRead<'a> {
-            bytes: &'a [u8],
-            position: usize,
-            chunk_size: usize,
-        }
-
-        impl Read for ChunkedRead<'_> {
-            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-                let remaining = &self.bytes[self.position..];
-                let read = remaining.len().min(buf.len()).min(self.chunk_size);
-                buf[..read].copy_from_slice(&remaining[..read]);
-                self.position += read;
-                Ok(read)
+    group.bench_function("copy_of_100_rows", |b| {
+        b.iter(|| {
+            for _ in 0..100 {
+                conn.copy_data(black_box(b"1\tsome text for a row\t2026-11-12\n"));
             }
-        }
+            block_on(conn.flush()).unwrap();
+        })
+    });
 
-        group.bench_function("buffered_reader_103_messages", |b| {
-            b.iter(|| {
-                let mut stream = black_box(stream_bytes.as_slice());
-                let mut reader = MessageReader::new();
-                for _ in 0..103 {
-                    black_box(reader.read_message_sync(&mut stream).unwrap());
-                }
-            })
-        });
-
-        group.bench_function("64_byte_reads_103_messages", |b| {
-            b.iter(|| {
-                let mut stream = ChunkedRead {
-                    bytes: black_box(&stream_bytes),
-                    position: 0,
-                    chunk_size: 64,
-                };
-                let mut reader = MessageReader::new();
-                for _ in 0..103 {
-                    black_box(reader.read_message_sync(&mut stream).unwrap());
-                }
-            })
-        });
-
-        group.finish();
-    }
-
-    #[cfg(not(feature = "sync"))]
-    let _ = c;
+    group.finish();
 }
 
-criterion_group!(
-    benches,
-    bench_put_query,
-    bench_put_parse,
-    bench_put_bind,
-    bench_put_describe,
-    bench_put_execute,
-    bench_put_fn_call,
-    bench_chained_operations,
-    bench_read_message,
-    bench_stream_reader,
-    bench_stream_reader_sync,
-);
+/// One request and its reply at a time, as a client sees them that does not
+/// pipeline.
+fn round_trip(c: &mut Criterion) {
+    let mut group = c.benchmark_group("round_trip");
+
+    for (name, value_len) in [("row_of_8_bytes", 8), ("row_of_100KiB", 100 * 1024)] {
+        let mut reply = Vec::new();
+        frame(&mut reply, b'2', b"");
+        frame(&mut reply, b'D', &row(1, &vec![b'x'; value_len]));
+        frame(&mut reply, b'C', b"SELECT 1\0");
+        frame(&mut reply, b'Z', b"I");
+        let mut conn = Connection::new(Blocking(Answering::new(&reply)));
+
+        group.bench_function(name, |b| {
+            b.iter(|| {
+                lookup(&mut conn, black_box(7));
+                block_on(async {
+                    let mut response = conn.response();
+                    response.bind_complete().await.unwrap();
+                    let mut bytes = 0;
+                    while let Some(row) = response.row().await.unwrap() {
+                        bytes += row.iter().flatten().map(<[u8]>::len).sum::<usize>();
+                    }
+                    response.finish().await.unwrap();
+                    bytes
+                })
+            })
+        });
+    }
+
+    group.finish();
+}
+
+criterion_group!(benches, encode, receive, send, round_trip);
 criterion_main!(benches);

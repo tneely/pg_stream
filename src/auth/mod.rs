@@ -1,33 +1,27 @@
-//! Authentication implementations for Postgres connections.
+//! Authentication mechanisms.
 //!
-//! This module provides implementations for the various authentication
-//! mechanisms supported by PostgreSQL:
-//!
-//! - **SCRAM-SHA-256**: The modern, secure default authentication method
-//! - **MD5**: Legacy password hashing (still widely used)
-//! - **Cleartext**: Plain text password (use only over TLS)
-//!
-//! # Example
-//!
-//! ```rust
-//! use pg_stream::auth::ScramClient;
-//!
-//! // Create a SCRAM client for authentication
-//! let mut client = ScramClient::new("username", "password");
-//!
-//! // Generate client-first message
-//! let client_first = client.client_first();
-//!
-//! // After receiving server-first, generate client-final
-//! // let client_final = client.client_final(&server_first)?;
-//! ```
+//! [`Startup`](crate::startup::Startup) drives these for you. They are public
+//! for code that runs the authentication exchange itself.
 
-mod cleartext;
 mod md5;
 mod scram;
 
-pub use cleartext::cleartext_password;
 pub use md5::md5_password;
-pub use scram::{
-    ChannelBinding, MAX_SCRAM_ITERATIONS, ScramClient, ScramError, tls_server_end_point,
-};
+pub use scram::{ChannelBinding, MAX_SCRAM_ITERATIONS, Scram, ScramProof, tls_server_end_point};
+
+/// Produces GSSAPI or SSPI tokens.
+///
+/// Token generation needs a platform security library, so this crate carries
+/// the exchange and leaves the tokens to an implementation of this trait.
+pub trait GssProvider {
+    /// Advances the security context with the server's latest token, which is
+    /// empty on the first call, and returns the next token to send. An empty
+    /// token means there is nothing to send.
+    fn step(&mut self, token: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>>;
+}
+
+impl<G: GssProvider + ?Sized> GssProvider for &mut G {
+    fn step(&mut self, token: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+        (**self).step(token)
+    }
+}

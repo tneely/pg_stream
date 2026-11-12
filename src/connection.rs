@@ -1,648 +1,576 @@
-//! Postgres connection handling.
-//!
-//! This module provides [`PgConnection`], a thin wrapper around a stream
-//! that handles buffered message writing and frame reading.
-//!
-//! # Async Example
-//!
-//! ```no_run
-//! # #[cfg(feature = "async")]
-//! # async fn example() -> std::io::Result<()> {
-//! use pg_stream::connection::PgConnection;
-//! use pg_stream::message::PgProtocol;
-//!
-//! let stream = tokio::net::TcpStream::connect("localhost:5432").await?;
-//! let mut conn = PgConnection::new(stream);
-//!
-//! // Build messages using the PgProtocol trait directly on the connection
-//! conn.query("SELECT 1")
-//!     .sync();
-//!
-//! // Send buffered messages
-//! conn.flush().await?;
-//!
-//! // Read response
-//! let msg = conn.recv().await?;
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! # Sync Example
-//!
-//! ```no_run
-//! # #[cfg(feature = "sync")]
-//! # fn example() -> std::io::Result<()> {
-//! use std::net::TcpStream;
-//! use pg_stream::connection::PgConnection;
-//! use pg_stream::message::PgProtocol;
-//!
-//! let stream = TcpStream::connect("localhost:5432")?;
-//! let mut conn = PgConnection::new(stream);
-//!
-//! // Build messages using the PgProtocol trait directly on the connection
-//! conn.query("SELECT 1")
-//!     .sync();
-//!
-//! // Send buffered messages
-//! conn.flush_sync()?;
-//!
-//! // Read response
-//! let msg = conn.recv_sync()?;
-//! # Ok(())
-//! # }
-//! ```
+//! A connection to a server.
 
-use bytes::{BufMut, Bytes, BytesMut, buf::UninitSlice};
+use std::{
+    future::poll_fn,
+    io,
+    task::{Context, Poll, ready},
+};
 
-#[cfg(feature = "sync")]
-use bytes::Buf;
+use crate::{
+    Error, Frontend, ProtocolError, Response, Result, Transport,
+    backend::{AsyncMessage, ErrorResponse, Frame, Frames, Message, TransactionStatus, code},
+    buffer::{Peek, ReadBuffer},
+    outbox::Outbox,
+};
 
-#[cfg(feature = "async")]
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+/// How many bytes of asynchronous messages are kept for
+/// [`Connection::async_messages`] before new ones are dropped.
+const MAX_ASYNC_BACKLOG: usize = 256 * 1024;
 
-#[cfg(feature = "sync")]
-use std::io::{Read, Write};
-
-use crate::message::backend::{MessageLimits, MessageReader, PgMessage};
-
-/// A Postgres connection wrapping a stream with buffered message building.
+/// A connection to a server: a stream, plus the buffers and bookkeeping needed
+/// to speak the protocol over it.
 ///
-/// `PgConnection` implements [`BufMut`] and [`PgProtocol`](crate::message::PgProtocol),
-/// so protocol messages can be written directly on the connection:
+/// # Sending
 ///
+/// [`Frontend`] methods queue messages; nothing reaches the server until the
+/// queue is written out. That happens in [`flush`](Self::flush), and also
+/// whenever the connection waits for the server, so queued messages are never
+/// stranded behind a read:
+///
+/// ```no_run
+/// # async fn example<S: pg_stream::Transport>(mut conn: pg_stream::Connection<S>) -> pg_stream::Result<()> {
+/// use pg_stream::Frontend;
+///
+/// conn.query("SELECT 1");
+/// let status = conn.response().finish().await?; // sends the query, then reads
+/// # Ok(())
+/// # }
 /// ```
-/// # use pg_stream::connection::PgConnection;
-/// # use pg_stream::message::PgProtocol;
-/// # let stream: Vec<u8> = vec![];
-/// # let mut conn = PgConnection::new(stream);
-/// conn.query("SELECT 1")
-///     .sync();
-/// ```
-pub struct PgConnection<S> {
+///
+/// # Receiving
+///
+/// - [`response`](Self::response) reads one cycle of replies with the
+///   protocol's rules applied. This is the place to start.
+/// - [`recv`](Self::recv) returns every message exactly as the server sent it.
+/// - [`recv_frame`](Self::recv_frame) does the same with an owned message, for
+///   handing to another task.
+/// - [`recv_frames`](Self::recv_frames) does the same with every message that
+///   has arrived, in one owned piece.
+///
+/// # Pipelining
+///
+/// Queue as many cycles as you like before reading any replies. Reads keep
+/// writing and writes keep reading, so neither side can stall the other with a
+/// full socket buffer however large the pipeline. Replies the server sends
+/// while a large pipeline is still being written are held in memory.
+///
+/// That takes a transport which can wait on both directions at once.
+/// [`Blocking`](crate::Blocking) cannot, and says what to do instead.
+///
+/// # Cancel safety
+///
+/// Every future returned by a connection can be dropped at any point. No bytes
+/// are lost or sent twice, and the next call picks up where it left off.
+pub struct Connection<S> {
     stream: S,
-    /// Outgoing write buffer for frontend messages.
-    buf: BytesMut,
-    /// Incoming read buffer / framer for backend messages.
-    reader: MessageReader,
+    read: ReadBuffer,
+    /// The stream reported end-of-file while output was being flushed.
+    read_closed: bool,
+    outbox: Outbox,
+    /// Bytes have been written to the stream since it was last flushed.
+    unflushed: bool,
+    state: State,
+    backlog: AsyncBacklog,
 }
 
-impl<S> PgConnection<S> {
-    /// Create a new connection wrapping the given stream.
+struct State {
+    status: TransactionStatus,
+    /// A [`Response`] has been handed out and its ReadyForQuery has not been
+    /// read yet.
+    cycle_open: bool,
+    /// Cycles whose [`Response`] was dropped early. Their remaining replies
+    /// are discarded before anything else is read.
+    abandoned: u32,
+    /// The server is waiting for COPY data, and the message that ends the
+    /// COPY has not been queued.
+    copy_in: bool,
+    /// CopyDone and CopyFail messages queued while no COPY was known to be
+    /// waiting for one. A pipeline can end a COPY before its CopyInResponse
+    /// has been read, so each of these answers one COPY still to come.
+    ///
+    /// The server ignores a CopyDone or CopyFail that reaches it outside a
+    /// COPY, typically after the COPY failed. That one is counted here all the
+    /// same, and makes the next COPY look ended before it is. Erring that way
+    /// only costs the diagnosis of a COPY left waiting; the opposite error
+    /// would refuse pipelines that are correct.
+    copy_ends_queued: u32,
+    desynchronized: bool,
+}
+
+impl State {
+    #[inline]
+    fn observe(&mut self, code: u8, body: &[u8]) {
+        match code {
+            code::READY_FOR_QUERY => {
+                self.status = TransactionStatus::try_parse(body).unwrap_or(self.status);
+                self.copy_in = false;
+            }
+            code::COPY_IN_RESPONSE | code::COPY_BOTH_RESPONSE => {
+                match self.copy_ends_queued.checked_sub(1) {
+                    Some(remaining) => self.copy_ends_queued = remaining,
+                    None => self.copy_in = true,
+                }
+            }
+            code::COMMAND_COMPLETE | code::ERROR_RESPONSE => self.copy_in = false,
+            _ => {}
+        }
+    }
+
+    /// Notes a message that has been queued for sending.
+    fn queued(&mut self, code: u8) {
+        if matches!(code, b'c' | b'f') && !std::mem::take(&mut self.copy_in) {
+            self.copy_ends_queued += 1;
+        }
+    }
+}
+
+impl<S> Connection<S> {
+    /// Wraps a stream that is ready for the startup packet, or on which
+    /// startup has already been completed by other means.
     pub fn new(stream: S) -> Self {
         Self {
             stream,
-            buf: BytesMut::with_capacity(4096),
-            reader: MessageReader::new(),
+            read: ReadBuffer::new(),
+            read_closed: false,
+            outbox: Outbox::default(),
+            unflushed: false,
+            state: State {
+                status: TransactionStatus::Idle,
+                cycle_open: false,
+                abandoned: 0,
+                copy_in: false,
+                copy_ends_queued: 0,
+                desynchronized: false,
+            },
+            backlog: AsyncBacklog::default(),
         }
     }
 
-    /// Create a new connection with a specified write-buffer capacity.
-    pub fn with_capacity(stream: S, capacity: usize) -> Self {
-        Self {
-            stream,
-            buf: BytesMut::with_capacity(capacity),
-            reader: MessageReader::new(),
-        }
+    /// Limits the size of the messages this connection will accept, to bound
+    /// the memory a server can make it use. The default is the protocol's own
+    /// maximum of 1 GiB.
+    pub fn set_max_message_len(&mut self, max: usize) {
+        self.read.max_message_len = max;
     }
 
-    /// Create a connection with custom backend-message size limits.
-    pub fn with_message_limits(stream: S, limits: MessageLimits) -> Self {
-        Self {
-            stream,
-            buf: BytesMut::with_capacity(4096),
-            reader: MessageReader::with_limits(limits),
-        }
+    /// The transaction state as of the last ReadyForQuery.
+    pub fn transaction_status(&self) -> TransactionStatus {
+        self.state.status
     }
 
-    /// Create a connection seeded with bytes already read from the stream, so
-    /// the startup handshake can hand off anything buffered past `ReadyForQuery`.
-    pub fn with_read_buffer(stream: S, prebuffered: BytesMut) -> Self {
-        Self::with_read_buffer_and_limits(stream, prebuffered, MessageLimits::default())
-    }
-
-    /// Create a connection with custom limits and bytes already read from the
-    /// stream.
-    pub fn with_read_buffer_and_limits(
-        stream: S,
-        prebuffered: BytesMut,
-        limits: MessageLimits,
-    ) -> Self {
-        Self {
-            stream,
-            buf: BytesMut::with_capacity(4096),
-            reader: MessageReader::from_buffer_with_limits(prebuffered, limits),
-        }
-    }
-
-    /// Take the buffered outgoing bytes, leaving an empty buffer.
+    /// The NoticeResponse, NotificationResponse and ParameterStatus messages
+    /// that arrived during [`Response`]s since this was last called.
     ///
-    /// This is useful for manually sending the bytes or inspecting them.
-    pub fn take_buf(&mut self) -> Bytes {
-        self.buf.split().freeze()
+    /// The server may send these at any time, so responses set them aside
+    /// rather than treat them as replies. Up to 256 KiB are kept; call this
+    /// regularly if you care about them. [`recv`](Self::recv) and
+    /// [`recv_frame`](Self::recv_frame) return them in place instead.
+    pub fn async_messages(&mut self) -> impl Iterator<Item = AsyncMessage<'_>> {
+        self.backlog.drain()
     }
 
-    /// Returns true if there are outgoing bytes waiting to be sent.
-    pub fn has_pending(&self) -> bool {
-        !self.buf.is_empty()
+    /// The queue of messages to send. Whole messages encoded elsewhere can
+    /// be appended to it directly.
+    ///
+    /// A write takes what it sends out of the queue, so an empty queue does
+    /// not mean that everything has been written. [`unsent`](Self::unsent)
+    /// says how much has not.
+    pub fn buf(&mut self) -> &mut Vec<u8> {
+        self.outbox.queue()
     }
 
-    /// Returns the number of buffered outgoing bytes.
-    pub fn pending_len(&self) -> usize {
-        self.buf.len()
+    /// The number of bytes queued and not yet written to the stream.
+    pub fn unsent(&self) -> usize {
+        self.outbox.len()
     }
 
-    /// Returns `true` if a complete backend message is already buffered and can
-    /// be returned by `recv` without reading from the stream.
-    pub fn has_buffered_message(&self) -> bool {
-        self.reader.has_message()
-    }
-
-    /// Consume the connection and return the underlying stream, the pending
-    /// outgoing bytes, and any buffered incoming bytes.
-    pub fn into_parts(self) -> (S, BytesMut, BytesMut) {
-        (self.stream, self.buf, self.reader.into_buffer())
-    }
-
-    /// Get a reference to the underlying stream.
-    pub fn stream(&self) -> &S {
+    /// The underlying stream.
+    pub fn get_ref(&self) -> &S {
         &self.stream
     }
 
-    /// Get a mutable reference to the underlying stream when doing so cannot
-    /// bypass buffered protocol data.
-    ///
-    /// Returns [`WouldBlock`](std::io::ErrorKind::WouldBlock) while outgoing
-    /// bytes are pending or incoming bytes have been prefetched. Flush or
-    /// receive that data first, or use [`into_parts`](Self::into_parts) to take
-    /// explicit ownership of all three parts.
-    pub fn stream_mut(&mut self) -> std::io::Result<&mut S> {
-        if !self.buf.is_empty() || !self.reader.buffered().is_empty() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WouldBlock,
-                "direct stream access would bypass buffered protocol data",
-            ));
+    /// The underlying stream. Reading or writing it directly bypasses the
+    /// connection's buffers.
+    pub fn get_mut(&mut self) -> &mut S {
+        &mut self.stream
+    }
+
+    /// Returns the stream, discarding anything buffered.
+    pub fn into_inner(self) -> S {
+        self.stream
+    }
+
+    /// Brings the connection's view of what has been queued up to date.
+    fn scan_queued(&mut self) {
+        self.outbox.scan(|code| self.state.queued(code));
+    }
+
+    /// Whether the server is waiting for COPY data that nothing queued so far
+    /// will bring to an end.
+    fn awaits_copy_data(&mut self) -> bool {
+        self.scan_queued();
+        self.state.copy_in
+    }
+
+    /// Fails if the replies up to the next ReadyForQuery cannot be skipped,
+    /// because there will not be one.
+    pub(crate) fn check_skippable(&mut self) -> Result<()> {
+        if self.state.desynchronized {
+            return Err(ProtocolError::Desynchronized.into());
         }
-        Ok(&mut self.stream)
-    }
-}
-
-// Implement BufMut to enable PgProtocol trait methods directly on PgConnection
-unsafe impl<S> BufMut for PgConnection<S> {
-    fn remaining_mut(&self) -> usize {
-        self.buf.remaining_mut()
-    }
-
-    unsafe fn advance_mut(&mut self, cnt: usize) {
-        // SAFETY: caller guarantees cnt bytes have been initialized
-        unsafe { self.buf.advance_mut(cnt) }
-    }
-
-    fn chunk_mut(&mut self) -> &mut UninitSlice {
-        self.buf.chunk_mut()
-    }
-}
-
-// Async I/O implementation (feature-gated)
-#[cfg(feature = "async")]
-impl<S: AsyncWrite + Unpin> PgConnection<S> {
-    /// Flush all buffered messages to the stream.
-    ///
-    /// This writes all pending bytes to the underlying stream and
-    /// flushes the stream.
-    pub async fn flush(&mut self) -> std::io::Result<()> {
-        if !self.buf.is_empty() {
-            self.stream.write_all_buf(&mut self.buf).await?;
+        if self.awaits_copy_data() {
+            return Err(Error::unexpected(code::COPY_IN_RESPONSE, "ReadyForQuery"));
         }
-        self.stream.flush().await
+        Ok(())
     }
 
-    /// Write raw bytes after any messages already buffered on the connection.
-    ///
-    /// The bytes join the normal outgoing queue before it is flushed, so a
-    /// partial write or cancellation leaves only the unsent suffix pending.
-    /// Resume a cancelled call with [`flush`](Self::flush), rather than calling
-    /// `write_raw` with the same bytes again.
-    pub async fn write_raw(&mut self, bytes: &[u8]) -> std::io::Result<()> {
-        self.buf.extend_from_slice(bytes);
-        self.flush().await
-    }
-}
-
-#[cfg(feature = "async")]
-impl<S: AsyncRead + Unpin> PgConnection<S> {
-    /// Read a single backend message. Reads are buffered internally, so one
-    /// syscall may satisfy several `recv` calls and bodies are sliced zero-copy.
-    pub async fn recv(&mut self) -> std::io::Result<PgMessage> {
-        self.reader.read_message(&mut self.stream).await
-    }
-}
-
-// Sync I/O implementation (feature-gated)
-#[cfg(feature = "sync")]
-impl<S: Write> PgConnection<S> {
-    /// Flush all buffered messages to the stream (synchronous version).
-    ///
-    /// This writes all pending bytes to the underlying stream and
-    /// flushes the stream.
-    pub fn flush_sync(&mut self) -> std::io::Result<()> {
-        while !self.buf.is_empty() {
-            match self.stream.write(&self.buf) {
-                Ok(0) => {
-                    return Err(std::io::Error::from(std::io::ErrorKind::WriteZero));
-                }
-                Ok(written) => self.buf.advance(written),
-                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(err) => return Err(err),
-            }
+    /// Whether reading the message with this code would leave the server
+    /// waiting for COPY data that nothing queued so far will bring to an end.
+    pub(crate) fn starts_open_copy(&mut self, code: u8) -> bool {
+        let starts_copy = matches!(code, code::COPY_IN_RESPONSE | code::COPY_BOTH_RESPONSE);
+        starts_copy && {
+            self.scan_queued();
+            self.state.copy_ends_queued == 0
         }
-        self.stream.flush()
     }
 
-    /// Write raw bytes after any messages already buffered on the connection.
+    /// The message at the front of the read buffer, if a whole one is there
+    /// and nothing has to happen before it is handed out.
     ///
-    /// A partial-write error leaves only the unsent suffix in the connection;
-    /// call [`flush_sync`](Self::flush_sync) to resume it.
-    pub fn write_raw_sync(&mut self, bytes: &[u8]) -> std::io::Result<()> {
-        self.buf.extend_from_slice(bytes);
-        self.flush_sync()
-    }
-}
-
-#[cfg(feature = "sync")]
-impl<S: Read> PgConnection<S> {
-    /// Read a single backend message from the stream (synchronous version).
-    ///
-    /// Reads are buffered internally like the async [`recv`](Self::recv).
-    pub fn recv_sync(&mut self) -> std::io::Result<PgMessage> {
-        self.reader.read_message_sync(&mut self.stream)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::message::PgProtocol;
-
-    #[test]
-    fn test_frontend_message_methods() {
-        let stream: Vec<u8> = vec![];
-        let mut conn = PgConnection::new(stream);
-
-        conn.query("SELECT 1");
-
-        assert!(conn.has_pending());
-        assert!(conn.pending_len() > 0);
+    /// Messages usually arrive many to a read, so this is the common case. It
+    /// is answered without the machinery of [`poll_next`](Self::poll_next).
+    #[inline]
+    fn buffered_message(&self) -> Option<(u8, usize)> {
+        if self.state.abandoned > 0 || self.state.desynchronized {
+            return None;
+        }
+        match self.read.peek() {
+            Ok(Peek::Ready { code, body_len }) => Some((code, body_len)),
+            Ok(Peek::Need(_)) | Err(_) => None,
+        }
     }
 
-    #[test]
-    fn test_take_buf() {
-        let stream: Vec<u8> = vec![];
-        let mut conn = PgConnection::new(stream);
-
-        conn.sync();
-        let bytes = conn.take_buf();
-
-        assert!(!bytes.is_empty());
-        assert!(!conn.has_pending());
+    /// Like [`buffered_message`](Self::buffered_message), for a reply.
+    #[inline]
+    pub(crate) fn buffered_reply(&self) -> Option<(u8, usize)> {
+        let message = self.buffered_message();
+        message.filter(|&(code, _)| !code::is_async(code))
     }
 
-    #[test]
-    fn test_into_parts() {
-        let stream: Vec<u8> = vec![];
-        let mut conn = PgConnection::new(stream);
-
-        conn.query("test");
-        let (stream, buf, read_buf) = conn.into_parts();
-
-        assert!(stream.is_empty());
-        assert!(!buf.is_empty());
-        assert!(read_buf.is_empty());
+    /// Consumes the message [`poll_peek`](Self::poll_peek) reported, on
+    /// behalf of whoever is reading the connection now.
+    #[inline]
+    pub(crate) fn take(&mut self, code: u8, body_len: usize) -> &[u8] {
+        self.before_consuming(code);
+        let body = self.read.take(body_len);
+        self.state.observe(code, body);
+        body
     }
 
-    #[test]
-    fn test_chaining() {
-        let stream: Vec<u8> = vec![];
-        let mut conn = PgConnection::new(stream);
-
-        // Test that chaining works directly on PgConnection
-        conn.query("SELECT 1").sync().terminate();
-
-        assert!(conn.pending_len() > 0);
-    }
-
-    #[test]
-    fn test_builder_chaining() {
-        let stream: Vec<u8> = vec![];
-        let mut conn = PgConnection::new(stream);
-
-        // Test that builders return &mut PgConnection for chaining
-        conn.parse("", "SELECT $1", &[])
-            .bind("")
-            .finish(crate::params![1i32])
-            .execute("", 0)
-            .sync();
-
-        assert!(conn.pending_len() > 0);
-    }
-
-    #[test]
-    fn test_stream_mut_requires_empty_protocol_buffers() {
-        let mut conn = PgConnection::new(Vec::<u8>::new());
-        conn.sync();
-        assert_eq!(
-            conn.stream_mut().unwrap_err().kind(),
-            std::io::ErrorKind::WouldBlock
-        );
-
-        let _ = conn.take_buf();
-        assert!(conn.stream_mut().is_ok());
-
-        let mut conn =
-            PgConnection::with_read_buffer(Vec::<u8>::new(), BytesMut::from(&b"prefetched"[..]));
-        assert_eq!(
-            conn.stream_mut().unwrap_err().kind(),
-            std::io::ErrorKind::WouldBlock
-        );
-    }
-
-    #[cfg(feature = "async")]
-    mod async_tests {
-        use std::{
-            future::{Future, poll_fn},
-            pin::Pin,
-            sync::{
-                Arc,
-                atomic::{AtomicBool, Ordering},
+    /// What reading a message changes before its body is looked at.
+    #[inline]
+    fn before_consuming(&mut self, code: u8) {
+        match code {
+            // Abandoned cycles are discarded before anything else is read, so
+            // while any remain this ReadyForQuery ends one of them. It says
+            // nothing about a response opened since.
+            code::READY_FOR_QUERY => match self.state.abandoned.checked_sub(1) {
+                Some(remaining) => self.state.abandoned = remaining,
+                None => self.state.cycle_open = false,
             },
-            task::{Context, Poll},
-        };
-
-        use tokio::io::AsyncWrite;
-
-        use super::*;
-
-        struct PendingAfterFirstWrite {
-            output: Vec<u8>,
-            blocked: Arc<AtomicBool>,
-            wrote_once: bool,
-        }
-
-        impl AsyncWrite for PendingAfterFirstWrite {
-            fn poll_write(
-                mut self: Pin<&mut Self>,
-                _cx: &mut Context<'_>,
-                bytes: &[u8],
-            ) -> Poll<std::io::Result<usize>> {
-                if self.wrote_once && self.blocked.load(Ordering::Relaxed) {
-                    return Poll::Pending;
-                }
-
-                let written = bytes.len().min(2);
-                self.output.extend_from_slice(&bytes[..written]);
-                self.wrote_once = true;
-                Poll::Ready(Ok(written))
-            }
-
-            fn poll_flush(
-                self: Pin<&mut Self>,
-                _cx: &mut Context<'_>,
-            ) -> Poll<std::io::Result<()>> {
-                Poll::Ready(Ok(()))
-            }
-
-            fn poll_shutdown(
-                self: Pin<&mut Self>,
-                _cx: &mut Context<'_>,
-            ) -> Poll<std::io::Result<()>> {
-                Poll::Ready(Ok(()))
-            }
-        }
-
-        struct ErrorAfterFirstWrite {
-            output: Vec<u8>,
-            writes: usize,
-        }
-
-        impl AsyncWrite for ErrorAfterFirstWrite {
-            fn poll_write(
-                mut self: Pin<&mut Self>,
-                _cx: &mut Context<'_>,
-                bytes: &[u8],
-            ) -> Poll<std::io::Result<usize>> {
-                self.writes += 1;
-                if self.writes == 2 {
-                    return Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)));
-                }
-
-                let written = if self.writes == 1 {
-                    bytes.len().min(2)
-                } else {
-                    bytes.len()
-                };
-                self.output.extend_from_slice(&bytes[..written]);
-                Poll::Ready(Ok(written))
-            }
-
-            fn poll_flush(
-                self: Pin<&mut Self>,
-                _cx: &mut Context<'_>,
-            ) -> Poll<std::io::Result<()>> {
-                Poll::Ready(Ok(()))
-            }
-
-            fn poll_shutdown(
-                self: Pin<&mut Self>,
-                _cx: &mut Context<'_>,
-            ) -> Poll<std::io::Result<()>> {
-                Poll::Ready(Ok(()))
-            }
-        }
-
-        #[tokio::test]
-        async fn test_flush() {
-            let mut output = Vec::new();
-            let mut conn = PgConnection::new(&mut output);
-
-            conn.sync();
-            conn.flush().await.unwrap();
-
-            // Sync message: 'S' + length(4)
-            assert_eq!(output.len(), 5);
-            assert_eq!(output[0], b'S');
-        }
-
-        #[tokio::test]
-        async fn flush_preserves_progress_across_cancellation() {
-            let blocked = Arc::new(AtomicBool::new(true));
-            let writer = PendingAfterFirstWrite {
-                output: Vec::new(),
-                blocked: blocked.clone(),
-                wrote_once: false,
-            };
-            let mut conn = PgConnection::new(writer);
-            conn.sync();
-
-            let mut flush = Box::pin(conn.flush());
-            poll_fn(|cx| {
-                assert!(flush.as_mut().poll(cx).is_pending());
-                Poll::Ready(())
-            })
-            .await;
-            drop(flush);
-
-            assert_eq!(conn.pending_len(), 3);
-            blocked.store(false, Ordering::Relaxed);
-            conn.flush().await.unwrap();
-
-            let (writer, pending, _) = conn.into_parts();
-            assert!(pending.is_empty());
-            assert_eq!(writer.output, [b'S', 0, 0, 0, 4]);
-        }
-
-        #[tokio::test]
-        async fn flush_preserves_progress_across_write_error() {
-            let writer = ErrorAfterFirstWrite {
-                output: Vec::new(),
-                writes: 0,
-            };
-            let mut conn = PgConnection::new(writer);
-            conn.sync();
-
-            let err = conn.flush().await.unwrap_err();
-            assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
-            assert_eq!(conn.pending_len(), 3);
-
-            conn.flush().await.unwrap();
-            let (writer, pending, _) = conn.into_parts();
-            assert!(pending.is_empty());
-            assert_eq!(writer.output, [b'S', 0, 0, 0, 4]);
-        }
-
-        #[tokio::test]
-        async fn write_raw_follows_buffered_messages() {
-            let mut conn = PgConnection::new(Vec::<u8>::new());
-            conn.sync();
-            conn.write_raw(b"raw").await.unwrap();
-
-            let (output, pending, _) = conn.into_parts();
-            assert!(pending.is_empty());
-            assert_eq!(output, [b'S', 0, 0, 0, 4, b'r', b'a', b'w']);
-        }
-
-        #[tokio::test]
-        async fn test_recv() {
-            // Create a buffer with a valid message: ReadyForQuery 'Z' + len=5 + 'I'
-            let input: &[u8] = &[b'Z', 0, 0, 0, 5, b'I'];
-            let mut conn = PgConnection::new(input);
-
-            let msg = conn.recv().await.unwrap();
-
-            assert!(matches!(msg, PgMessage::ReadyForQuery(_)));
-        }
-
-        #[tokio::test]
-        async fn test_with_read_buffer_serves_prebuffered_then_stream() {
-            // Startup handed off one complete ParseComplete plus the first two
-            // bytes of a ReadyForQuery; the rest arrives from the stream.
-            let prebuffered = BytesMut::from(&[b'1', 0, 0, 0, 4, b'Z', 0][..]);
-            let stream: &[u8] = &[0, 0, 5, b'I'];
-            let mut conn = PgConnection::with_read_buffer(stream, prebuffered);
-
-            assert!(conn.has_buffered_message());
-            assert!(matches!(
-                conn.recv().await.unwrap(),
-                PgMessage::ParseComplete
-            ));
-            assert!(matches!(
-                conn.recv().await.unwrap(),
-                PgMessage::ReadyForQuery(_)
-            ));
+            code::COPY_IN_RESPONSE | code::COPY_BOTH_RESPONSE => self.scan_queued(),
+            _ => {}
         }
     }
 
-    #[cfg(feature = "sync")]
-    mod sync_tests {
-        use super::*;
-        use std::io::{Cursor, Write};
-
-        struct ErrorAfterFirstWrite {
-            output: Vec<u8>,
-            writes: usize,
+    /// Consumes an ErrorResponse and turns it into the error to return.
+    pub(crate) fn take_error(&mut self, body_len: usize) -> Error {
+        const CODE: u8 = code::ERROR_RESPONSE;
+        match ErrorResponse::try_parse(self.take(CODE, body_len)) {
+            Some(fields) => Error::Server(fields.to_error()),
+            None => ProtocolError::Malformed { code: CODE }.into(),
         }
+    }
 
-        impl Write for ErrorAfterFirstWrite {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.writes += 1;
-                if self.writes == 2 {
-                    return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
-                }
+    /// Consumes an asynchronous message into the backlog.
+    fn set_aside(&mut self, code: u8, body_len: usize) -> Result<()> {
+        let body = self.read.take(body_len);
+        Ok(self.backlog.push(code, body)?)
+    }
 
-                let written = if self.writes == 1 {
-                    bytes.len().min(2)
-                } else {
-                    bytes.len()
-                };
-                self.output.extend_from_slice(&bytes[..written]);
-                Ok(written)
+    /// Called when the connection is read directly. A [`Response`] borrows
+    /// the connection, so if its cycle is still open here, it was dropped
+    /// before the cycle ended and what is left of the cycle must be skipped.
+    fn abandon_open_cycle(&mut self) {
+        if std::mem::take(&mut self.state.cycle_open) {
+            self.state.abandoned += 1;
+            // Nothing can be skipped while the server waits on us for COPY
+            // data, and nothing here knows how to end that COPY on the
+            // caller's behalf.
+            self.state.desynchronized |= self.awaits_copy_data();
+        }
+    }
+}
+
+impl<S: Transport> Connection<S> {
+    /// Sends everything queued and waits until the stream has accepted it.
+    ///
+    /// Only needed when no read follows, since reads send too.
+    pub async fn flush(&mut self) -> Result<()> {
+        poll_fn(|cx| self.poll_flush(cx)).await
+    }
+
+    /// Receives the next message, whatever it is.
+    ///
+    /// This is the unfiltered view of the connection: asynchronous messages
+    /// arrive in place, errors arrive as [`Message::ErrorResponse`], and
+    /// knowing which reply answers which request is up to the caller.
+    pub async fn recv(&mut self) -> Result<Message<'_>> {
+        self.abandon_open_cycle();
+        let (code, body_len) = match self.buffered_message() {
+            Some(message) => message,
+            None => self.wait_for_message().await?,
+        };
+        Ok(Message::parse(code, self.take(code, body_len))?)
+    }
+
+    /// Like [`recv`](Self::recv), but returns an owned [`Frame`] that can be
+    /// sent to another task. The body shares the read buffer's allocation
+    /// instead of being copied out of it.
+    pub async fn recv_frame(&mut self) -> Result<Frame> {
+        self.abandon_open_cycle();
+        let (code, body_len) = match self.buffered_message() {
+            Some(message) => message,
+            None => self.wait_for_message().await?,
+        };
+        self.before_consuming(code);
+        let body = self.read.take_owned(body_len);
+        self.state.observe(code, &body);
+        Ok(Frame { code, body })
+    }
+
+    /// Like [`recv_frame`](Self::recv_frame), but returns every message that
+    /// has arrived, up to and including the next ReadyForQuery, as one owned
+    /// piece of the read buffer.
+    ///
+    /// ```no_run
+    /// # async fn example<S: pg_stream::Transport>(mut conn: pg_stream::Connection<S>) -> pg_stream::Result<()> {
+    /// use pg_stream::{Frontend, Message};
+    ///
+    /// conn.query("SELECT generate_series(1, 1000)");
+    /// loop {
+    ///     let frames = conn.recv_frames().await?;
+    ///     for message in frames.messages() {
+    ///         if let Message::DataRow(row) = message? {
+    ///             println!("{row:?}");
+    ///         }
+    ///     }
+    ///     if frames.ends_cycle() {
+    ///         break;
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn recv_frames(&mut self) -> Result<Frames> {
+        self.abandon_open_cycle();
+        let (mut code, mut body_len) = match self.buffered_message() {
+            Some(message) => message,
+            None => self.wait_for_message().await?,
+        };
+        let mark = self.read.mark();
+        let ends_cycle = loop {
+            self.take(code, body_len);
+            if code == code::READY_FOR_QUERY {
+                break true;
             }
+            match self.buffered_message() {
+                Some(next) => (code, body_len) = next,
+                None => break false,
+            }
+        };
+        Ok(Frames::new(self.read.take_owned_since(mark), ends_cycle))
+    }
 
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
+    /// Waits for the next message. Callers try
+    /// [`buffered_message`](Self::buffered_message) first, in their own
+    /// bodies: a future awaited there is not reliably inlined, and this one
+    /// is only needed when the message has yet to arrive.
+    async fn wait_for_message(&mut self) -> Result<(u8, usize)> {
+        poll_fn(|cx| self.poll_next(cx)).await
+    }
+
+    /// Like [`wait_for_message`](Self::wait_for_message), for a reply.
+    pub(crate) async fn wait_for_reply(&mut self) -> Result<(u8, usize)> {
+        poll_fn(|cx| self.poll_reply(cx)).await
+    }
+
+    /// Reads the replies to one cycle: everything up to and including the
+    /// next ReadyForQuery.
+    pub fn response(&mut self) -> Response<'_, S> {
+        self.abandon_open_cycle();
+        self.state.cycle_open = true;
+        Response::new(self)
+    }
+
+    /// Writes queued output for as long as the stream accepts it. Ready once
+    /// all of it has been written and flushed.
+    fn poll_send(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        loop {
+            let pending = self.outbox.pending(|code| self.state.queued(code));
+            if pending.is_empty() {
+                break;
+            }
+            match ready!(self.stream.poll_write(cx, pending))? {
+                0 => return Poll::Ready(Err(io::ErrorKind::WriteZero.into())),
+                written => self.outbox.advance(written),
+            }
+            self.unflushed = true;
+        }
+
+        if self.unflushed {
+            ready!(self.stream.poll_flush(cx))?;
+            self.unflushed = false;
+        }
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        while self.poll_send(cx)?.is_pending() {
+            // The stream is not taking our output. If that is because the
+            // server is itself stuck sending replies we have not read, taking
+            // them off the wire is the only way either side moves again.
+            if self.read_closed {
+                return Poll::Pending;
+            }
+            let spare = self.read.spare(1);
+            match ready!(self.stream.poll_read(cx, spare))? {
+                0 => self.read_closed = true,
+                read => self.read.filled(read),
             }
         }
+        Poll::Ready(Ok(()))
+    }
 
-        #[test]
-        fn test_flush_sync() {
-            let mut output = Vec::new();
-            let mut conn = PgConnection::new(&mut output);
-
-            conn.sync();
-            conn.flush_sync().unwrap();
-
-            // Sync message: 'S' + length(4)
-            assert_eq!(output.len(), 5);
-            assert_eq!(output[0], b'S');
-        }
-
-        #[test]
-        fn flush_sync_preserves_progress_across_write_error() {
-            let writer = ErrorAfterFirstWrite {
-                output: Vec::new(),
-                writes: 0,
+    /// Makes a whole message available at the front of the read buffer and
+    /// reports its code and body length, without consuming it.
+    fn poll_peek(&mut self, cx: &mut Context<'_>) -> Poll<Result<(u8, usize)>> {
+        loop {
+            let missing = match self.read.peek()? {
+                Peek::Ready { code, body_len } => return Poll::Ready(Ok((code, body_len))),
+                Peek::Need(missing) => missing,
             };
-            let mut conn = PgConnection::new(writer);
-            conn.sync();
+            if self.read_closed {
+                return Poll::Ready(Err(io::Error::from(io::ErrorKind::UnexpectedEof).into()));
+            }
 
-            let err = conn.flush_sync().unwrap_err();
-            assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
-            assert_eq!(conn.pending_len(), 3);
+            // Whatever is queued has to go out before the server can answer.
+            // A failed write is not reported here: a server that hangs up has
+            // usually said why first, and that message is still to be read.
+            if !self.outbox.is_empty() || self.unflushed {
+                let _ = self.poll_send(cx);
+            }
 
-            conn.flush_sync().unwrap();
-            let (writer, pending, _) = conn.into_parts();
-            assert!(pending.is_empty());
-            assert_eq!(writer.output, [b'S', 0, 0, 0, 4]);
+            let spare = self.read.spare(missing);
+            match ready!(self.stream.poll_read(cx, spare))? {
+                0 => self.read_closed = true,
+                read => self.read.filled(read),
+            }
         }
+    }
 
-        #[test]
-        fn write_raw_sync_follows_buffered_messages() {
-            let mut conn = PgConnection::new(Vec::<u8>::new());
-            conn.sync();
-            conn.write_raw_sync(b"raw").unwrap();
-
-            let (output, pending, _) = conn.into_parts();
-            assert!(pending.is_empty());
-            assert_eq!(output, [b'S', 0, 0, 0, 4, b'r', b'a', b'w']);
+    /// [`poll_peek`](Self::poll_peek), once the replies of abandoned cycles
+    /// have been discarded.
+    fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Result<(u8, usize)>> {
+        if self.state.desynchronized {
+            return Poll::Ready(Err(ProtocolError::Desynchronized.into()));
         }
-
-        #[test]
-        fn test_recv_sync() {
-            // Create a buffer with a valid message: ReadyForQuery 'Z' + len=5 + 'I'
-            let input: &[u8] = &[b'Z', 0, 0, 0, 5, b'I'];
-            let mut conn = PgConnection::new(Cursor::new(input));
-
-            let msg = conn.recv_sync().unwrap();
-
-            assert!(matches!(msg, PgMessage::ReadyForQuery(_)));
+        while self.state.abandoned > 0 {
+            let (code, body_len) = ready!(self.poll_peek(cx))?;
+            if self.starts_open_copy(code) {
+                self.state.desynchronized = true;
+                return Poll::Ready(Err(ProtocolError::Desynchronized.into()));
+            }
+            self.discard(code, body_len)?;
         }
+        self.poll_peek(cx)
+    }
+
+    /// Like [`poll_next`](Self::poll_next), but sets asynchronous messages
+    /// aside so that only replies are reported.
+    fn poll_reply(&mut self, cx: &mut Context<'_>) -> Poll<Result<(u8, usize)>> {
+        loop {
+            let (code, body_len) = ready!(self.poll_next(cx))?;
+            if !code::is_async(code) {
+                return Poll::Ready(Ok((code, body_len)));
+            }
+            self.set_aside(code, body_len)?;
+        }
+    }
+
+    /// Consumes a message of an abandoned cycle.
+    fn discard(&mut self, code: u8, body_len: usize) -> Result<()> {
+        match code::is_async(code) {
+            true => self.set_aside(code, body_len)?,
+            false => _ = self.take(code, body_len),
+        }
+        Ok(())
+    }
+}
+
+impl<S> Frontend for Connection<S> {
+    type Buf = Vec<u8>;
+
+    fn with_buf<R>(&mut self, write: impl FnOnce(&mut Vec<u8>) -> R) -> R {
+        write(self.buf())
+    }
+}
+
+impl<S: std::fmt::Debug> std::fmt::Debug for Connection<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = f.debug_struct("Connection");
+        debug.field("stream", &self.stream);
+        debug.field("unsent", &self.unsent());
+        debug.field("unread", &self.read.buffered().len());
+        debug.field("transaction_status", &self.state.status);
+        debug.finish_non_exhaustive()
+    }
+}
+
+/// Asynchronous messages set aside while reading replies, stored as the raw
+/// frames they arrived in.
+#[derive(Default)]
+struct AsyncBacklog {
+    frames: Vec<u8>,
+    /// `frames` has been handed out by [`drain`](Self::drain) and is stale.
+    drained: bool,
+}
+
+impl AsyncBacklog {
+    fn push(&mut self, code: u8, body: &[u8]) -> Result<(), ProtocolError> {
+        AsyncMessage::try_parse(code, body).ok_or(ProtocolError::Malformed { code })?;
+        if std::mem::take(&mut self.drained) {
+            self.frames.clear();
+        }
+        if self.frames.len() + body.len() <= MAX_ASYNC_BACKLOG {
+            let len = body.len() as u32;
+            self.frames.push(code);
+            self.frames.extend_from_slice(&len.to_be_bytes());
+            self.frames.extend_from_slice(body);
+        }
+        Ok(())
+    }
+
+    fn drain(&mut self) -> impl Iterator<Item = AsyncMessage<'_>> {
+        if std::mem::replace(&mut self.drained, true) {
+            self.frames.clear();
+        }
+        let mut frames = &self.frames[..];
+        std::iter::from_fn(move || {
+            let (&[code, len @ ..], rest) = frames.split_first_chunk::<5>()?;
+            let (body, rest) = rest.split_at_checked(u32::from_be_bytes(len) as usize)?;
+            frames = rest;
+            AsyncMessage::try_parse(code, body)
+        })
     }
 }

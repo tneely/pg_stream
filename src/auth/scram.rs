@@ -1,684 +1,452 @@
-//! SCRAM-SHA-256 authentication implementation.
-//!
-//! Implements the Salted Challenge Response Authentication Mechanism (SCRAM)
-//! as specified in RFC 5802, using SHA-256 as the hash function.
-//!
-//! # Protocol Overview
+//! SCRAM-SHA-256 (RFC 5802, RFC 7677), with optional channel binding
+//! (RFC 5929).
 //!
 //! ```text
-//! Client                                  Server
-//!   |                                        |
-//!   |-- client-first: n,,n=user,r=nonce ---->|
-//!   |                                        |
-//!   |<-- server-first: r=nonce+server,s=salt,i=iterations
-//!   |                                        |
-//!   |-- client-final: c=biws,r=nonce,p=proof |
-//!   |                                        |
-//!   |<-- server-final: v=verifier -----------|
+//! client-first   n,,n=,r=<client nonce>
+//! server-first   r=<client nonce><server nonce>,s=<salt>,i=<iterations>
+//! client-final   c=<channel binding>,r=<nonce>,p=<client proof>
+//! server-final   v=<server signature>
 //! ```
 
-use std::num::NonZeroU32;
+use std::fmt;
 
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256, Sha384, Sha512};
 
-type HmacSha256 = Hmac<Sha256>;
+use crate::ScramError;
 
-/// Maximum server-selected PBKDF2 iteration count accepted by the client.
-///
-/// PostgreSQL currently defaults to 4,096 iterations. This upper bound leaves
-/// substantial room for stronger server policies while bounding authentication
-/// CPU work from an untrusted peer.
+/// The most PBKDF2 iterations a server may ask for. PostgreSQL defaults to
+/// 4096; the cap bounds the CPU time an untrusted server can demand.
 pub const MAX_SCRAM_ITERATIONS: u32 = 1_000_000;
 
-/// Errors that can occur during SCRAM authentication.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ScramError {
-    /// Server's nonce doesn't start with client's nonce.
-    InvalidServerNonce,
-    /// Failed to parse server-first message.
-    InvalidServerFirst(String),
-    /// Failed to parse server-final message.
-    InvalidServerFinal(String),
-    /// Server signature verification failed.
-    ServerSignatureMismatch,
-    /// Base64 decoding failed.
-    Base64Error(String),
-    /// Invalid iteration count.
-    InvalidIterationCount,
-    /// The server certificate could not be parsed for channel binding.
-    InvalidCertificate,
-    /// The server did not offer a channel-binding mechanism but the client
-    /// required one.
-    ChannelBindingRequired,
-}
-
-/// Channel binding configuration for a SCRAM exchange.
-///
-/// Selects the GS2 header and `c=` attribute per RFC 5802 / RFC 5929.
+/// How a SCRAM exchange is tied to the TLS connection underneath it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChannelBinding {
-    /// Client does not support channel binding (not over TLS). GS2 flag `n`.
-    NotSupported,
-    /// Client supports channel binding but the server offered only the
-    /// non-PLUS mechanism; sent for downgrade detection. GS2 flag `y`.
-    NotUsed,
-    /// Bind to the `tls-server-end-point` data (hash of the server cert). Used
-    /// with `SCRAM-SHA-256-PLUS`. GS2 flag `p=tls-server-end-point`.
+    /// The client cannot bind: there is no TLS, or no server certificate.
+    Unsupported,
+    /// The client could bind, but the server did not offer to. Saying so lets
+    /// the server detect an attacker who stripped the offer.
+    Unused,
+    /// Bind to the server certificate, using the hash from
+    /// [`tls_server_end_point`]. Selects `SCRAM-SHA-256-PLUS`.
     TlsServerEndPoint(Vec<u8>),
 }
 
 impl ChannelBinding {
-    /// The GS2 header (channel-binding flag plus empty authzid).
-    fn gs2_header(&self) -> Vec<u8> {
+    /// The GS2 header: the binding flag, then an empty authorization identity.
+    fn gs2_header(&self) -> &'static str {
         match self {
-            ChannelBinding::NotSupported => b"n,,".to_vec(),
-            ChannelBinding::NotUsed => b"y,,".to_vec(),
-            ChannelBinding::TlsServerEndPoint(_) => b"p=tls-server-end-point,,".to_vec(),
+            ChannelBinding::Unsupported => "n,,",
+            ChannelBinding::Unused => "y,,",
+            ChannelBinding::TlsServerEndPoint(_) => "p=tls-server-end-point,,",
         }
     }
 
-    /// The base64-encoded `c=` attribute: GS2 header followed by the binding
-    /// data (empty unless a real binding is in use).
-    fn cbind_input_b64(&self) -> String {
-        let mut input = self.gs2_header();
-        if let ChannelBinding::TlsServerEndPoint(data) = self {
-            input.extend_from_slice(data);
+    /// The `c=` attribute: the GS2 header followed by the binding data.
+    fn attribute(&self) -> String {
+        let mut input = self.gs2_header().as_bytes().to_vec();
+        if let ChannelBinding::TlsServerEndPoint(hash) = self {
+            input.extend_from_slice(hash);
         }
         BASE64.encode(input)
     }
 }
 
-/// Computes `tls-server-end-point` channel binding data (RFC 5929) for a DER
-/// server certificate: the cert hashed with its signature algorithm's hash
-/// (MD5/SHA-1 upgraded to SHA-256). Feed to [`ChannelBinding::TlsServerEndPoint`].
-pub fn tls_server_end_point(cert_der: &[u8]) -> Result<Vec<u8>, ScramError> {
-    let oid = cert_signature_oid(cert_der).ok_or(ScramError::InvalidCertificate)?;
-    Ok(digest_for_signature_oid(&oid)(cert_der))
-}
-
-impl std::fmt::Display for ScramError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ScramError::InvalidServerNonce => {
-                write!(f, "server nonce does not contain client nonce prefix")
-            }
-            ScramError::InvalidServerFirst(msg) => {
-                write!(f, "failed to parse server-first message: {msg}")
-            }
-            ScramError::InvalidServerFinal(msg) => {
-                write!(f, "failed to parse server-final message: {msg}")
-            }
-            ScramError::ServerSignatureMismatch => write!(f, "server signature mismatch"),
-            ScramError::Base64Error(msg) => write!(f, "base64 error: {msg}"),
-            ScramError::InvalidIterationCount => write!(f, "invalid iteration count"),
-            ScramError::InvalidCertificate => {
-                write!(f, "could not parse server certificate for channel binding")
-            }
-            ScramError::ChannelBindingRequired => {
-                write!(f, "server did not offer a channel-binding mechanism")
-            }
-        }
-    }
-}
-
-impl std::error::Error for ScramError {}
-
-/// SCRAM-SHA-256 client state machine.
-///
-/// Implements the client side of the SCRAM authentication protocol.
-///
-/// # Example
-///
-/// ```rust
-/// use pg_stream::auth::ScramClient;
-///
-/// let mut client = ScramClient::new("username", "password");
-///
-/// // Send client-first message to server
-/// let client_first = client.client_first();
-///
-/// // Receive server-first from server
-/// // let server_first = "...";
-/// // let client_final = client.client_final(&server_first)?;
-///
-/// // Send client-final to server, receive server-final
-/// // client.verify_server(&server_final)?;
-/// ```
-pub struct ScramClient {
-    username: String,
+/// A SCRAM exchange that has produced its first message and awaits the
+/// server's.
+pub struct Scram {
     password: String,
-    channel_binding: ChannelBinding,
-    client_nonce: String,
-    client_first_bare: String,
-    server_first: Option<String>,
-    auth_message: Option<String>,
-    server_key: Option<[u8; 32]>,
+    binding: ChannelBinding,
+    nonce: String,
+    client_first: String,
 }
 
-impl ScramClient {
-    /// Creates a new SCRAM client without channel binding (`SCRAM-SHA-256`).
+impl Scram {
+    /// Starts an exchange.
     ///
-    /// # Arguments
-    ///
-    /// * `username` - The database username
-    /// * `password` - The user's password
-    pub fn new(username: &str, password: &str) -> Self {
-        Self::with_channel_binding(username, password, ChannelBinding::NotSupported)
+    /// The password is used as given: it is not normalized with SASLprep, so
+    /// a password containing non-ASCII characters only matches if it was set
+    /// in the same normalized form.
+    pub fn new(password: &str, binding: ChannelBinding) -> Self {
+        let mut nonce = [0u8; 18];
+        getrandom::fill(&mut nonce).expect("the operating system provides randomness");
+        Self::with_nonce(password, binding, &BASE64.encode(nonce))
     }
 
-    /// Creates a new SCRAM client with the given [`ChannelBinding`]
-    /// (`TlsServerEndPoint` selects `SCRAM-SHA-256-PLUS`).
-    pub fn with_channel_binding(
-        username: &str,
-        password: &str,
-        channel_binding: ChannelBinding,
-    ) -> Self {
+    fn with_nonce(password: &str, binding: ChannelBinding, nonce: &str) -> Self {
+        // PostgreSQL ignores the user name here and uses the startup packet's.
+        let client_first = format!("{}n=,r={nonce}", binding.gs2_header());
         Self {
-            username: username.to_string(),
-            password: password.to_string(),
-            channel_binding,
-            client_nonce: generate_nonce(),
-            client_first_bare: String::new(),
-            server_first: None,
-            auth_message: None,
-            server_key: None,
+            password: password.into(),
+            binding,
+            nonce: nonce.into(),
+            client_first,
         }
     }
 
-    /// Creates a new SCRAM client with a specific nonce (for testing).
-    #[cfg(test)]
-    pub fn with_nonce(username: &str, password: &str, nonce: &str) -> Self {
-        Self::with_nonce_and_binding(username, password, nonce, ChannelBinding::NotSupported)
-    }
-
-    /// Creates a SCRAM client with a fixed nonce and channel binding (testing).
-    #[cfg(test)]
-    pub fn with_nonce_and_binding(
-        username: &str,
-        password: &str,
-        nonce: &str,
-        channel_binding: ChannelBinding,
-    ) -> Self {
-        Self {
-            username: username.to_string(),
-            password: password.to_string(),
-            channel_binding,
-            client_nonce: nonce.to_string(),
-            client_first_bare: String::new(),
-            server_first: None,
-            auth_message: None,
-            server_key: None,
-        }
-    }
-
-    /// Returns the SCRAM mechanism name for this client's channel binding.
+    /// The SASL mechanism this exchange speaks.
     pub fn mechanism(&self) -> &'static str {
-        match self.channel_binding {
+        match self.binding {
             ChannelBinding::TlsServerEndPoint(_) => "SCRAM-SHA-256-PLUS",
-            _ => "SCRAM-SHA-256",
+            ChannelBinding::Unsupported | ChannelBinding::Unused => "SCRAM-SHA-256",
         }
     }
 
-    /// Generates the client-first message.
-    ///
-    /// This is the first message sent by the client to initiate SCRAM authentication.
-    /// Format: `<gs2-header>n=username,r=client_nonce`
-    pub fn client_first(&mut self) -> String {
-        let gs2_header = String::from_utf8(self.channel_binding.gs2_header())
-            .expect("GS2 header is valid UTF-8");
-
-        // Username is SASLprepped and escaped (= -> =3D, , -> =2C).
-        let escaped_username = escape_username(&self.username);
-        self.client_first_bare = format!("n={},r={}", escaped_username, self.client_nonce);
-
-        format!("{}{}", gs2_header, self.client_first_bare)
+    /// The client-first message, for the SASLInitialResponse.
+    pub fn client_first(&self) -> &str {
+        &self.client_first
     }
 
-    /// Processes the server-first message and generates the client-final message.
-    ///
-    /// # Arguments
-    ///
-    /// * `server_first` - The server-first message received from the server
-    ///
-    /// # Returns
-    ///
-    /// The client-final message to send to the server.
-    pub fn client_final(&mut self, server_first: &str) -> Result<String, ScramError> {
-        self.server_first = Some(server_first.to_string());
+    /// Answers the server-first message with the client's proof.
+    pub fn respond(self, server_first: &[u8]) -> Result<ScramProof, ScramError> {
+        let server_first = std::str::from_utf8(server_first).or(Err(ScramError::InvalidMessage))?;
+        let attribute = |name| attribute(server_first, name).ok_or(ScramError::InvalidMessage);
 
-        // Parse server-first message: r=nonce,s=salt,i=iterations
-        let (server_nonce, salt, iterations) = parse_server_first(server_first)?;
-
-        // Verify server nonce starts with client nonce
-        if !server_nonce.starts_with(&self.client_nonce) {
-            return Err(ScramError::InvalidServerNonce);
+        let nonce = attribute("r=")?;
+        if !nonce.starts_with(&self.nonce) || nonce.len() == self.nonce.len() {
+            return Err(ScramError::InvalidNonce);
         }
+        let salt = BASE64.decode(attribute("s=")?);
+        let salt = salt.or(Err(ScramError::InvalidMessage))?;
+        let iterations = match attribute("i=")?.parse() {
+            Ok(iterations @ 1..=MAX_SCRAM_ITERATIONS) => iterations,
+            _ => return Err(ScramError::InvalidIterationCount),
+        };
 
-        // Decode base64 salt
-        let salt_bytes = BASE64
-            .decode(&salt)
-            .map_err(|e| ScramError::Base64Error(e.to_string()))?;
+        let salted_password = pbkdf2(self.password.as_bytes(), &salt, iterations);
+        let client_key = hmac(&salted_password, b"Client Key");
+        let server_key = hmac(&salted_password, b"Server Key");
+        let stored_key: [u8; 32] = Sha256::digest(client_key).into();
 
-        // Compute salted password using PBKDF2
-        let salted_password = pbkdf2_sha256(self.password.as_bytes(), &salt_bytes, iterations);
+        // Everything both sides have said so far, minus the GS2 header and
+        // the proof itself.
+        let client_first_bare = &self.client_first[self.binding.gs2_header().len()..];
+        let without_proof = format!("c={},r={nonce}", self.binding.attribute());
+        let auth_message = format!("{client_first_bare},{server_first},{without_proof}");
 
-        // Compute client and server keys
-        let client_key = hmac_sha256(&salted_password, b"Client Key");
-        let server_key = hmac_sha256(&salted_password, b"Server Key");
-        self.server_key = Some(server_key);
+        let mut proof = hmac(&stored_key, auth_message.as_bytes());
+        xor(&mut proof, &client_key);
 
-        // Compute stored key: H(ClientKey)
-        let stored_key = sha256(&client_key);
-
-        // c= is base64(GS2 header ++ channel binding data).
-        let client_final_without_proof = format!(
-            "c={},r={}",
-            self.channel_binding.cbind_input_b64(),
-            server_nonce
-        );
-
-        // Build auth message
-        let auth_message = format!(
-            "{},{},{}",
-            self.client_first_bare, server_first, client_final_without_proof
-        );
-        self.auth_message = Some(auth_message.clone());
-
-        // Compute client signature: HMAC(StoredKey, AuthMessage)
-        let client_signature = hmac_sha256(&stored_key, auth_message.as_bytes());
-
-        // Compute client proof: ClientKey XOR ClientSignature
-        let client_proof = xor_bytes(&client_key, &client_signature);
-        let client_proof_b64 = BASE64.encode(client_proof);
-
-        Ok(format!(
-            "{},p={}",
-            client_final_without_proof, client_proof_b64
-        ))
-    }
-
-    /// Verifies the server-final message.
-    ///
-    /// # Arguments
-    ///
-    /// * `server_final` - The server-final message received from the server
-    pub fn verify_server(&self, server_final: &str) -> Result<(), ScramError> {
-        let server_key = self
-            .server_key
-            .as_ref()
-            .ok_or(ScramError::InvalidServerFinal(
-                "client_final not called".into(),
-            ))?;
-        let auth_message = self
-            .auth_message
-            .as_ref()
-            .ok_or(ScramError::InvalidServerFinal(
-                "client_final not called".into(),
-            ))?;
-
-        // Parse server-final: v=verifier
-        let server_signature_b64 = parse_server_final(server_final)?;
-        let server_signature = BASE64
-            .decode(&server_signature_b64)
-            .map_err(|e| ScramError::Base64Error(e.to_string()))?;
-
-        // Compute expected server signature: HMAC(ServerKey, AuthMessage)
-        let expected_signature = hmac_sha256(server_key, auth_message.as_bytes());
-
-        if server_signature != expected_signature {
-            return Err(ScramError::ServerSignatureMismatch);
-        }
-
-        Ok(())
+        Ok(ScramProof {
+            client_final: format!("{without_proof},p={}", BASE64.encode(proof)),
+            server_signature: hmac(&server_key, auth_message.as_bytes()),
+        })
     }
 }
 
-/// Generates a random nonce for SCRAM authentication.
-fn generate_nonce() -> String {
-    let mut bytes = [0u8; 18];
-    getrandom::fill(&mut bytes).expect("random generation failed");
-    BASE64.encode(bytes)
+impl fmt::Debug for Scram {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The password is left out.
+        let mut debug = f.debug_struct("Scram");
+        debug
+            .field("mechanism", &self.mechanism())
+            .finish_non_exhaustive()
+    }
 }
 
-/// Escapes a username for SCRAM.
-/// `=` becomes `=3D`, `,` becomes `=2C`
-fn escape_username(username: &str) -> String {
-    username.replace('=', "=3D").replace(',', "=2C")
+/// A SCRAM exchange that has proven the client's identity and awaits the
+/// server's proof in return.
+pub struct ScramProof {
+    client_final: String,
+    server_signature: [u8; 32],
 }
 
-/// Parses the server-first message.
-/// Format: `r=nonce,s=salt,i=iterations`
-fn parse_server_first(msg: &str) -> Result<(String, String, NonZeroU32), ScramError> {
-    let mut nonce = None;
-    let mut salt = None;
-    let mut iterations = None;
+impl ScramProof {
+    /// The client-final message, for the SASLResponse.
+    pub fn client_final(&self) -> &str {
+        &self.client_final
+    }
 
-    for part in msg.split(',') {
-        if let Some(value) = part.strip_prefix("r=") {
-            nonce = Some(value.to_string());
-        } else if let Some(value) = part.strip_prefix("s=") {
-            salt = Some(value.to_string());
-        } else if let Some(value) = part.strip_prefix("i=") {
-            let count = value
-                .parse::<u32>()
-                .map_err(|_| ScramError::InvalidIterationCount)?;
-            iterations = Some(
-                NonZeroU32::new(count)
-                    .filter(|count| count.get() <= MAX_SCRAM_ITERATIONS)
-                    .ok_or(ScramError::InvalidIterationCount)?,
-            );
+    /// Checks the server-final message, which proves the server knows the
+    /// password too.
+    pub fn verify(self, server_final: &[u8]) -> Result<(), ScramError> {
+        let server_final = std::str::from_utf8(server_final).or(Err(ScramError::InvalidMessage))?;
+        let signature = attribute(server_final, "v=").ok_or(ScramError::InvalidMessage)?;
+        let signature = BASE64.decode(signature);
+        let signature = signature.or(Err(ScramError::InvalidMessage))?;
+
+        // Compared without short-circuiting, so timing says nothing about how
+        // much of a forged signature was right.
+        let same_len = signature.len() == self.server_signature.len();
+        let bytes = signature.iter().zip(self.server_signature);
+        let difference = bytes.fold(0, |difference, (a, b)| difference | (a ^ b));
+        match same_len && difference == 0 {
+            true => Ok(()),
+            false => Err(ScramError::ServerSignatureMismatch),
         }
     }
+}
 
-    match (nonce, salt, iterations) {
-        (Some(n), Some(s), Some(i)) => Ok((n, s, i)),
-        _ => Err(ScramError::InvalidServerFirst(
-            "missing required fields".into(),
-        )),
+impl fmt::Debug for ScramProof {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ScramProof").finish_non_exhaustive()
     }
 }
 
-/// Parses the server-final message.
-/// Format: `v=verifier`
-fn parse_server_final(msg: &str) -> Result<String, ScramError> {
-    for part in msg.split(',') {
-        if let Some(value) = part.strip_prefix("v=") {
-            return Ok(value.to_string());
-        }
-    }
-    Err(ScramError::InvalidServerFinal(
-        "missing verifier field".into(),
-    ))
+/// The value of the attribute starting with `name` (such as `"r="`) in a
+/// comma-separated SCRAM message.
+fn attribute<'a>(message: &'a str, name: &str) -> Option<&'a str> {
+    let mut attributes = message.split(',');
+    attributes.find_map(|attribute| attribute.strip_prefix(name))
 }
 
-/// Reads a DER TLV at `data[0..]`, returning `(tag, contents, rest)`.
-///
-/// Handles short and long definite-length forms; rejects indefinite length.
-fn der_read_tlv(data: &[u8]) -> Option<(u8, &[u8], &[u8])> {
-    let tag = *data.first()?;
-    let first_len = *data.get(1)?;
-    let (len, header) = if first_len & 0x80 == 0 {
-        (first_len as usize, 2)
-    } else {
-        let n = (first_len & 0x7f) as usize;
-        if n == 0 || n > 4 {
-            return None; // indefinite or absurdly long
-        }
-        let mut len = 0usize;
-        for i in 0..n {
-            len = (len << 8) | *data.get(2 + i)? as usize;
-        }
-        (len, 2 + n)
-    };
-    let contents = data.get(header..header + len)?;
-    Some((tag, contents, &data[header + len..]))
-}
-
-/// Extracts the signatureAlgorithm OID from a DER X.509 certificate
-/// (`SEQUENCE { tbsCertificate, signatureAlgorithm { OID, .. }, .. }`).
-fn cert_signature_oid(cert_der: &[u8]) -> Option<Vec<u8>> {
-    const SEQUENCE: u8 = 0x30;
-    const OID: u8 = 0x06;
-
-    let (tag, cert_body, _) = der_read_tlv(cert_der)?;
-    if tag != SEQUENCE {
-        return None;
-    }
-    // Skip tbsCertificate, then read signatureAlgorithm.
-    let (_, _tbs, after_tbs) = der_read_tlv(cert_body)?;
-    let (tag, sig_alg, _) = der_read_tlv(after_tbs)?;
-    if tag != SEQUENCE {
-        return None;
-    }
-    let (tag, oid, _) = der_read_tlv(sig_alg)?;
-    if tag != OID {
-        return None;
-    }
-    Some(oid.to_vec())
-}
-
-/// Maps a signature algorithm OID to its channel-binding digest. Per RFC 5929
-/// MD5/SHA-1 upgrade to SHA-256; unknown OIDs default to SHA-256 like Postgres.
-fn digest_for_signature_oid(oid: &[u8]) -> fn(&[u8]) -> Vec<u8> {
-    // OID bytes after the DER tag/len, i.e. the value only.
-    // sha384WithRSAEncryption 1.2.840.113549.1.1.12
-    const SHA384_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0c];
-    // sha512WithRSAEncryption 1.2.840.113549.1.1.13
-    const SHA512_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0d];
-    // ecdsa-with-SHA384 1.2.840.10045.4.3.3
-    const SHA384_ECDSA: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x03];
-    // ecdsa-with-SHA512 1.2.840.10045.4.3.4
-    const SHA512_ECDSA: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x04];
-
-    fn digest<D: Digest>(data: &[u8]) -> Vec<u8> {
-        D::digest(data).to_vec()
-    }
-
-    match oid {
-        SHA384_RSA | SHA384_ECDSA => digest::<Sha384>,
-        SHA512_RSA | SHA512_ECDSA => digest::<Sha512>,
-        _ => digest::<Sha256>,
+fn xor(into: &mut [u8; 32], other: &[u8; 32]) {
+    for (byte, other) in into.iter_mut().zip(other) {
+        *byte ^= other;
     }
 }
 
-/// Computes PBKDF2-HMAC-SHA256 (RFC 8018) for a single output block, which is
-/// all SCRAM-SHA-256 needs since its key length equals the hash length.
-fn pbkdf2_sha256(password: &[u8], salt: &[u8], iterations: NonZeroU32) -> [u8; 32] {
-    let prf = HmacSha256::new_from_slice(password).expect("HMAC accepts any key length");
-
-    let mut mac = prf.clone();
-    mac.update(salt);
-    mac.update(&1u32.to_be_bytes());
-    let mut u: [u8; 32] = mac.finalize().into_bytes().into();
-
-    let mut result = u;
-    for _ in 1..iterations.get() {
-        let mut mac = prf.clone();
-        mac.update(&u);
-        u = mac.finalize().into_bytes().into();
-        for (r, b) in result.iter_mut().zip(u) {
-            *r ^= b;
-        }
-    }
-    result
-}
-
-/// Computes HMAC-SHA256.
-fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
-    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
+fn hmac(key: &[u8], data: &[u8]) -> [u8; 32] {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC takes a key of any length");
     mac.update(data);
     mac.finalize().into_bytes().into()
 }
 
-/// Computes SHA256.
-fn sha256(data: &[u8]) -> [u8; 32] {
-    Sha256::digest(data).into()
-}
+/// PBKDF2-HMAC-SHA-256 (RFC 8018) for a single output block, which is all
+/// SCRAM needs: its key is as long as the hash.
+fn pbkdf2(password: &[u8], salt: &[u8], iterations: u32) -> [u8; 32] {
+    let prf = Hmac::<Sha256>::new_from_slice(password).expect("HMAC takes a key of any length");
 
-/// XORs two byte arrays.
-fn xor_bytes(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
-    let mut result = [0u8; 32];
-    for i in 0..32 {
-        result[i] = a[i] ^ b[i];
+    let mut mac = prf.clone();
+    mac.update(salt);
+    mac.update(&1u32.to_be_bytes());
+    let mut block: [u8; 32] = mac.finalize().into_bytes().into();
+
+    let mut result = block;
+    for _ in 1..iterations {
+        let mut mac = prf.clone();
+        mac.update(&block);
+        block = mac.finalize().into_bytes().into();
+        xor(&mut result, &block);
     }
     result
+}
+
+/// Computes the `tls-server-end-point` channel binding data for a server
+/// certificate in DER form: the certificate hashed with the hash of its
+/// signature algorithm, or SHA-256 where that is MD5 or SHA-1.
+pub fn tls_server_end_point(certificate: &[u8]) -> Result<Vec<u8>, ScramError> {
+    // sha384WithRSAEncryption, sha512WithRSAEncryption, ecdsa-with-SHA384 and
+    // ecdsa-with-SHA512, as DER-encoded OID contents.
+    const SHA384_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0c];
+    const SHA512_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0d];
+    const SHA384_ECDSA: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x03];
+    const SHA512_ECDSA: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x04];
+
+    let algorithm = signature_algorithm(certificate).ok_or(ScramError::InvalidCertificate)?;
+    Ok(match algorithm {
+        SHA384_RSA | SHA384_ECDSA => Sha384::digest(certificate).to_vec(),
+        SHA512_RSA | SHA512_ECDSA => Sha512::digest(certificate).to_vec(),
+        _ => Sha256::digest(certificate).to_vec(),
+    })
+}
+
+/// Finds the signature algorithm OID of an X.509 certificate:
+/// `SEQUENCE { tbsCertificate, SEQUENCE { OID, .. }, .. }`.
+fn signature_algorithm(certificate: &[u8]) -> Option<&[u8]> {
+    const SEQUENCE: u8 = 0x30;
+    const OID: u8 = 0x06;
+
+    let (SEQUENCE, certificate, _) = der_element(certificate)? else {
+        return None;
+    };
+    let (_, _tbs_certificate, rest) = der_element(certificate)?;
+    let (SEQUENCE, algorithm, _) = der_element(rest)? else {
+        return None;
+    };
+    let (OID, oid, _) = der_element(algorithm)? else {
+        return None;
+    };
+    Some(oid)
+}
+
+/// Splits one DER element off the front of `data`: its tag, its contents, and
+/// what follows it.
+fn der_element(data: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+    let (&[tag, first], rest) = data.split_first_chunk::<2>()?;
+    let (len, rest) = match first {
+        // Short form: the byte is the length.
+        0..0x80 => (first as usize, rest),
+        // Long form: the low bits count the length bytes that follow.
+        _ => {
+            let (len, rest) = rest.split_at_checked((first & 0x7f) as usize)?;
+            if len.is_empty() || len.len() > 4 {
+                return None;
+            }
+            (
+                len.iter().fold(0, |len, &byte| (len << 8) | byte as usize),
+                rest,
+            )
+        }
+    };
+    let (contents, rest) = rest.split_at_checked(len)?;
+    Some((tag, contents, rest))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// A client-first with the user name the RFC's example uses, which
+    /// PostgreSQL clients leave empty.
+    fn rfc_client(password: &str, nonce: &str) -> Scram {
+        let mut scram = Scram::with_nonce(password, ChannelBinding::Unsupported, nonce);
+        scram.client_first = format!("n,,n=user,r={nonce}");
+        scram
+    }
+
+    /// Why a client with the nonce `nonce` refuses a server-first message.
+    fn rejection(server_first: &[u8]) -> Option<ScramError> {
+        let scram = rfc_client("pw", "nonce");
+        scram.respond(server_first).err()
+    }
+
+    /// The worked example from RFC 7677 section 3.
     #[test]
-    fn test_escape_username() {
-        assert_eq!(escape_username("user"), "user");
-        assert_eq!(escape_username("user=test"), "user=3Dtest");
-        assert_eq!(escape_username("user,test"), "user=2Ctest");
-        assert_eq!(escape_username("a=b,c"), "a=3Db=2Cc");
+    fn matches_the_rfc_7677_test_vector() {
+        let scram = rfc_client("pencil", "rOprNGfwEbeRWgbNEkqO");
+        assert_eq!(scram.client_first(), "n,,n=user,r=rOprNGfwEbeRWgbNEkqO");
+        assert_eq!(scram.mechanism(), "SCRAM-SHA-256");
+
+        let server_first = b"r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,\
+            s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096";
+        let client_final = "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,\
+            p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=";
+        let server_final = b"v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=";
+        let proof = scram.respond(server_first).unwrap();
+        assert_eq!(proof.client_final(), client_final);
+        proof.verify(server_final).unwrap();
     }
 
     #[test]
-    fn test_parse_server_first() {
-        let msg = "r=clientnonce+servernonce,s=c2FsdA==,i=4096";
-        let (nonce, salt, iterations) = parse_server_first(msg).unwrap();
-        assert_eq!(nonce, "clientnonce+servernonce");
-        assert_eq!(salt, "c2FsdA==");
-        assert_eq!(iterations.get(), 4096);
-    }
+    fn rejects_a_server_that_does_not_know_the_password() {
+        let respond = || {
+            let server_first = b"r=nonce+server,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096";
+            rfc_client("pencil", "nonce").respond(server_first).unwrap()
+        };
 
-    #[test]
-    fn test_parse_server_first_rejects_unbounded_work() {
-        for iterations in [0, MAX_SCRAM_ITERATIONS + 1] {
-            let msg = format!("r=nonce,s=c2FsdA==,i={iterations}");
-            assert!(matches!(
-                parse_server_first(&msg),
-                Err(ScramError::InvalidIterationCount)
-            ));
+        for forged in [
+            "v=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "v=AAAA",
+            "v=",
+        ] {
+            let err = respond().verify(forged.as_bytes()).unwrap_err();
+            assert_eq!(err, ScramError::ServerSignatureMismatch, "{forged}");
+        }
+        for malformed in ["e=other-error", "v=not base64", ""] {
+            let err = respond().verify(malformed.as_bytes()).unwrap_err();
+            assert_eq!(err, ScramError::InvalidMessage, "{malformed}");
         }
     }
 
     #[test]
-    fn test_parse_server_final() {
-        let msg = "v=cm1GM3pydXVYNWhKNDZlcm5yL2RLbTdrSzg0cXdqRS8=";
-        let verifier = parse_server_final(msg).unwrap();
-        assert_eq!(verifier, "cm1GM3pydXVYNWhKNDZlcm5yL2RLbTdrSzg0cXdqRS8=");
+    fn rejects_a_nonce_the_server_did_not_extend() {
+        for nonce in ["other", "nonce"] {
+            let server_first = format!("r={nonce},s=c2FsdA==,i=4096");
+            let err = rejection(server_first.as_bytes());
+            assert_eq!(err, Some(ScramError::InvalidNonce), "{nonce}");
+        }
     }
 
     #[test]
-    fn test_client_first() {
-        let mut client = ScramClient::with_nonce("user", "password", "rOprNGfwEbeRWgbNEkqO");
-        let client_first = client.client_first();
-
-        // Should start with GS2 header
-        assert!(client_first.starts_with("n,,"));
-        // Should contain username
-        assert!(client_first.contains("n=user"));
-        // Should contain nonce
-        assert!(client_first.contains("r=rOprNGfwEbeRWgbNEkqO"));
-    }
-
-    /// The complete SCRAM-SHA-256 test vector from RFC 7677 section 3, pinning
-    /// the PBKDF2/HMAC/SHA-256 stack to published values.
-    #[test]
-    fn test_scram_full_flow_rfc7677_vector() {
-        let mut client = ScramClient::with_nonce("user", "pencil", "rOprNGfwEbeRWgbNEkqO");
-
-        let client_first = client.client_first();
-        assert_eq!(client_first, "n,,n=user,r=rOprNGfwEbeRWgbNEkqO");
-
-        let server_first = "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096";
-        let client_final = client.client_final(server_first).unwrap();
-        assert_eq!(
-            client_final,
-            "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,\
-             p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ="
-        );
-
-        client
-            .verify_server("v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=")
-            .expect("RFC 7677 server signature should verify");
-        assert!(matches!(
-            client.verify_server("v=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
-            Err(ScramError::ServerSignatureMismatch)
-        ));
+    fn bounds_the_work_a_server_can_demand() {
+        for iterations in ["0", "1000001", "-1", "many"] {
+            let server_first = format!("r=nonce+server,s=c2FsdA==,i={iterations}");
+            let err = rejection(server_first.as_bytes());
+            assert_eq!(err, Some(ScramError::InvalidIterationCount), "{iterations}");
+        }
     }
 
     #[test]
-    fn test_invalid_server_nonce() {
-        let mut client = ScramClient::with_nonce("user", "password", "clientnonce");
-        client.client_first();
-
-        // Server nonce doesn't start with client nonce
-        let server_first = "r=differentnonce,s=c2FsdA==,i=4096";
-        let result = client.client_final(server_first);
-        assert!(matches!(result, Err(ScramError::InvalidServerNonce)));
+    fn rejects_malformed_server_first_messages() {
+        for server_first in ["", "r=nonce+server,i=4096", "r=nonce+server,s=!!,i=4096"] {
+            let err = rejection(server_first.as_bytes());
+            assert_eq!(err, Some(ScramError::InvalidMessage), "{server_first}");
+        }
+        let err = rejection(&[0xff, 0xfe]);
+        assert_eq!(err, Some(ScramError::InvalidMessage));
     }
 
     #[test]
-    fn test_mechanism_name_by_binding() {
-        assert_eq!(ScramClient::new("u", "p").mechanism(), "SCRAM-SHA-256");
-        let plus = ScramClient::with_channel_binding(
-            "u",
-            "p",
-            ChannelBinding::TlsServerEndPoint(vec![0u8; 32]),
-        );
-        assert_eq!(plus.mechanism(), "SCRAM-SHA-256-PLUS");
+    fn channel_binding_selects_the_header_and_mechanism() {
+        let hash = vec![0xab; 32];
+        let bound = ChannelBinding::TlsServerEndPoint(hash.clone());
+        let cases = [
+            (
+                ChannelBinding::Unsupported,
+                "n,,",
+                "SCRAM-SHA-256",
+                "biws".to_string(),
+            ),
+            (
+                ChannelBinding::Unused,
+                "y,,",
+                "SCRAM-SHA-256",
+                "eSws".to_string(),
+            ),
+            (
+                bound,
+                "p=tls-server-end-point,,",
+                "SCRAM-SHA-256-PLUS",
+                BASE64.encode([b"p=tls-server-end-point,,".as_slice(), &hash].concat()),
+            ),
+        ];
+
+        for (binding, header, mechanism, attribute) in cases {
+            let scram = Scram::with_nonce("pw", binding, "nonce");
+            assert_eq!(scram.client_first(), format!("{header}n=,r=nonce"));
+            assert_eq!(scram.mechanism(), mechanism);
+
+            let proof = scram.respond(b"r=nonce+server,s=c2FsdA==,i=1").unwrap();
+            let expected = format!("c={attribute},r=nonce+server,p=");
+            assert!(
+                proof.client_final().starts_with(&expected),
+                "{}",
+                proof.client_final()
+            );
+        }
     }
 
     #[test]
-    fn test_gs2_header_and_cbind_encoding() {
-        // No channel binding: "n,," -> base64 "biws".
-        let mut c =
-            ScramClient::with_nonce_and_binding("u", "p", "nonce", ChannelBinding::NotSupported);
-        assert!(c.client_first().starts_with("n,,"));
-        assert_eq!(ChannelBinding::NotSupported.cbind_input_b64(), "biws");
-
-        // Supported but not used (downgrade guard): "y,," -> base64 "eSws".
-        let mut c = ScramClient::with_nonce_and_binding("u", "p", "nonce", ChannelBinding::NotUsed);
-        assert!(c.client_first().starts_with("y,,"));
-        assert_eq!(ChannelBinding::NotUsed.cbind_input_b64(), "eSws");
-
-        // tls-server-end-point: header + cert hash.
-        let cb = ChannelBinding::TlsServerEndPoint(vec![0xAB; 4]);
-        let mut c = ScramClient::with_nonce_and_binding("u", "p", "nonce", cb.clone());
-        assert!(c.client_first().starts_with("p=tls-server-end-point,,"));
-        let expected = BASE64.encode([b"p=tls-server-end-point,,".as_slice(), &[0xAB; 4]].concat());
-        assert_eq!(cb.cbind_input_b64(), expected);
+    fn nonces_are_random() {
+        let first = Scram::new("pw", ChannelBinding::Unsupported);
+        let second = Scram::new("pw", ChannelBinding::Unsupported);
+        assert_ne!(first.client_first(), second.client_first());
     }
 
-    #[test]
-    fn test_scram_plus_full_flow_binds_cert() {
-        let cert_hash = vec![0x11u8; 32];
-        let mut client = ScramClient::with_nonce_and_binding(
-            "user",
-            "pencil",
-            "rOprNGfwEbeRWgbNEkqO",
-            ChannelBinding::TlsServerEndPoint(cert_hash.clone()),
-        );
-
-        let client_first = client.client_first();
-        assert_eq!(
-            client_first,
-            "p=tls-server-end-point,,n=user,r=rOprNGfwEbeRWgbNEkqO"
-        );
-
-        let server_first = "r=rOprNGfwEbeRWgbNEkqO-server,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096";
-        let client_final = client.client_final(server_first).unwrap();
-
-        // c= must be base64("p=tls-server-end-point,," ++ cert_hash).
-        let expected_cbind =
-            BASE64.encode([b"p=tls-server-end-point,,".as_slice(), &cert_hash].concat());
-        assert!(client_final.starts_with(&format!("c={expected_cbind},r=")));
-        assert!(client_final.contains(",p="));
-    }
-
-    fn test_cert_der() -> Vec<u8> {
+    fn test_certificate() -> Vec<u8> {
         let pem = include_str!("../../tests/data/certs/server.crt");
-        let b64: String = pem
-            .lines()
-            .filter(|l| !l.starts_with("-----"))
-            .collect::<Vec<_>>()
-            .concat();
-        BASE64.decode(b64).unwrap()
+        let lines = pem.lines().filter(|line| !line.starts_with("-----"));
+        BASE64.decode(lines.collect::<String>()).unwrap()
     }
 
     #[test]
-    fn test_cert_signature_oid_and_binding_hash() {
-        let der = test_cert_der();
-        let oid = cert_signature_oid(&der).expect("should parse cert");
-        // Test cert is sha256WithRSAEncryption: 1.2.840.113549.1.1.11.
-        assert_eq!(oid, [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b]);
+    fn binds_to_a_certificate_with_its_signature_hash() {
+        let certificate = test_certificate();
+        // sha256WithRSAEncryption
+        let algorithm = signature_algorithm(&certificate).unwrap();
+        assert_eq!(
+            algorithm,
+            [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b]
+        );
 
-        // With SHA-256 signature, binding data is SHA-256 of the whole cert.
-        let binding = tls_server_end_point(&der).unwrap();
-        assert_eq!(binding, Sha256::digest(&der).to_vec());
-        assert_eq!(binding.len(), 32);
+        let binding = tls_server_end_point(&certificate).unwrap();
+        assert_eq!(binding, Sha256::digest(&certificate).to_vec());
     }
 
     #[test]
-    fn test_cert_parse_rejects_garbage() {
-        assert!(cert_signature_oid(&[0x30, 0x02, 0xFF]).is_none());
-        assert!(tls_server_end_point(b"not a cert").is_err());
+    fn rejects_data_that_is_not_a_certificate() {
+        for garbage in [
+            &b""[..],
+            b"not a certificate",
+            &[0x30, 0x02, 0xff],
+            &[0x30, 0x84, 0xff],
+        ] {
+            assert_eq!(
+                tls_server_end_point(garbage),
+                Err(ScramError::InvalidCertificate)
+            );
+        }
     }
 }
