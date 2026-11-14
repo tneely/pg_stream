@@ -29,10 +29,9 @@ impl Header {
         // The packets that open a connection (startup, TLS and cancel
         // requests) have no code. They begin with their length, whose first
         // byte is always zero, which no code is.
-        let (code, len) = match *bytes {
-            [0, a, b, c, ..] => (0, [0, a, b, c]),
-            [code, a, b, c, d, ..] => (code, [a, b, c, d]),
-            _ => return None,
+        let (code, len) = match *bytes.first()? {
+            0 => (0, *bytes.first_chunk::<4>()?),
+            code => (code, *bytes[1..].first_chunk::<4>()?),
         };
         let body_len = (u32::from_be_bytes(len) as usize).saturating_sub(4);
         Some(Self { code, body_len })
@@ -49,6 +48,12 @@ impl Header {
 }
 
 impl FrameScanner {
+    /// Whether the bytes scanned so far end where a message does.
+    #[inline]
+    pub fn is_between_messages(&self) -> bool {
+        self.have == 0 && self.skip == 0
+    }
+
     /// Scans the next bytes of the stream, calling `message` with the code of
     /// each message that begins in them. Packets without a code report zero.
     pub fn feed(&mut self, mut bytes: &[u8], mut message: impl FnMut(u8)) {

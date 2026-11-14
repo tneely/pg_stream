@@ -16,7 +16,7 @@ use sealed::Sealed;
 /// Format codes for a list of parameters or result columns.
 ///
 /// - a single [`Format`] applies to every value
-/// - a slice or array gives one format per value
+/// - a slice or array gives one format per value, by value or by reference
 pub trait Formats: Sealed {
     #[doc(hidden)]
     fn put<B: Buffer>(self, buf: &mut B);
@@ -50,6 +50,14 @@ impl<const N: usize> Formats for [Format; N] {
     }
 }
 
+impl<const N: usize> Sealed for &[Format; N] {}
+impl<const N: usize> Formats for &[Format; N] {
+    #[inline]
+    fn put<B: Buffer>(self, buf: &mut B) {
+        self.as_slice().put(buf)
+    }
+}
+
 #[inline]
 fn put_formats<B: Buffer>(buf: &mut B, len: usize, formats: impl Iterator<Item = Format>) {
     let len = u16::try_from(len).expect("the protocol allows at most 65535 values");
@@ -61,6 +69,8 @@ fn put_formats<B: Buffer>(buf: &mut B, len: usize, formats: impl Iterator<Item =
 ///
 /// - `()` is no parameters
 /// - [`params!`](crate::params) lists values that implement [`Param`]
+/// - a slice or array lists values of one type that does, such as `&[i64]`,
+///   `[&str; 2]` or `&[&(dyn Param + Sync)]`
 /// - [`params_with`] and [`try_params_with`] write values directly, in any
 ///   encoding
 pub trait Params: Sealed {
@@ -83,25 +93,45 @@ impl Params for () {
     }
 }
 
-impl Sealed for &[&dyn Param] {}
-impl Params for &[&dyn Param] {
+impl<P: Param> Sealed for &[P] {}
+impl<P: Param> Params for &[P] {
     type Error = Infallible;
 
     #[inline]
     fn encode<B: Buffer>(self, buf: &mut B) -> Result<(), Infallible> {
-        let mut formats = self.iter().map(|param| param.format());
+        let mut formats = self.iter().map(Param::format);
         let first = formats.next().unwrap_or_default();
         match formats.all(|format| format == first) {
             true => first.put(buf),
-            false => put_formats(buf, self.len(), self.iter().map(|param| param.format())),
+            false => put_formats(buf, self.len(), self.iter().map(Param::format)),
         }
 
         buf.with_vec(|values| {
             ParamWriter::run(values, |writer| {
-                self.iter().for_each(|param| writer.param(*param));
+                self.iter().for_each(|param| writer.param(param));
                 Ok(())
             })
         })
+    }
+}
+
+impl<P: Param, const N: usize> Sealed for &[P; N] {}
+impl<P: Param, const N: usize> Params for &[P; N] {
+    type Error = Infallible;
+
+    #[inline]
+    fn encode<B: Buffer>(self, buf: &mut B) -> Result<(), Infallible> {
+        self.as_slice().encode(buf)
+    }
+}
+
+impl<P: Param, const N: usize> Sealed for [P; N] {}
+impl<P: Param, const N: usize> Params for [P; N] {
+    type Error = Infallible;
+
+    #[inline]
+    fn encode<B: Buffer>(self, buf: &mut B) -> Result<(), Infallible> {
+        self.as_slice().encode(buf)
     }
 }
 
@@ -302,6 +332,12 @@ impl ParamWriter<'_> {
 /// strings and byte arrays, `Option` for NULL, and references to any of them.
 /// Implement it for your own types, or write values without it using
 /// [`params_with`].
+///
+/// Numbers are sent in binary, so the Rust type has to be the SQL type of the
+/// parameter: `i16` for `int2`, `i32` for `int4`, `i64` for `int8`, `f32` for
+/// `float4` and `f64` for `float8`. The server refuses a value of another
+/// width, and reads one of the same width as the type it expects. Send a
+/// number as a string to have the server convert it.
 pub trait Param {
     /// The format [`encode`](Self::encode) writes.
     fn format(&self) -> Format;
@@ -330,10 +366,12 @@ macro_rules! params {
 macro_rules! binary_param {
     ($($ty:ty),*) => {$(
         impl Param for $ty {
+            #[inline]
             fn format(&self) -> Format {
                 Format::Binary
             }
 
+            #[inline]
             fn encode(&self, buf: &mut Vec<u8>) -> IsNull {
                 buf.extend_from_slice(&self.to_be_bytes());
                 IsNull::No
@@ -345,10 +383,12 @@ macro_rules! binary_param {
 binary_param!(i16, i32, i64, f32, f64);
 
 impl Param for bool {
+    #[inline]
     fn format(&self) -> Format {
         Format::Binary
     }
 
+    #[inline]
     fn encode(&self, buf: &mut Vec<u8>) -> IsNull {
         buf.push(*self as u8);
         IsNull::No
@@ -356,10 +396,12 @@ impl Param for bool {
 }
 
 impl Param for str {
+    #[inline]
     fn format(&self) -> Format {
         Format::Text
     }
 
+    #[inline]
     fn encode(&self, buf: &mut Vec<u8>) -> IsNull {
         buf.extend_from_slice(self.as_bytes());
         IsNull::No
@@ -367,10 +409,12 @@ impl Param for str {
 }
 
 impl Param for [u8] {
+    #[inline]
     fn format(&self) -> Format {
         Format::Binary
     }
 
+    #[inline]
     fn encode(&self, buf: &mut Vec<u8>) -> IsNull {
         buf.extend_from_slice(self);
         IsNull::No
@@ -380,10 +424,12 @@ impl Param for [u8] {
 macro_rules! deref_param {
     ($($ty:ty => $target:ty),*) => {$(
         impl Param for $ty {
+            #[inline]
             fn format(&self) -> Format {
                 <$target as Param>::format(self)
             }
 
+            #[inline]
             fn encode(&self, buf: &mut Vec<u8>) -> IsNull {
                 <$target as Param>::encode(self, buf)
             }
@@ -394,30 +440,36 @@ macro_rules! deref_param {
 deref_param!(String => str, Vec<u8> => [u8], bytes::Bytes => [u8]);
 
 impl<const N: usize> Param for [u8; N] {
+    #[inline]
     fn format(&self) -> Format {
         self.as_slice().format()
     }
 
+    #[inline]
     fn encode(&self, buf: &mut Vec<u8>) -> IsNull {
         self.as_slice().encode(buf)
     }
 }
 
 impl<T: Param + ?Sized> Param for &T {
+    #[inline]
     fn format(&self) -> Format {
         (**self).format()
     }
 
+    #[inline]
     fn encode(&self, buf: &mut Vec<u8>) -> IsNull {
         (**self).encode(buf)
     }
 }
 
 impl<T: Param> Param for Option<T> {
+    #[inline]
     fn format(&self) -> Format {
         self.as_ref().map(Param::format).unwrap_or_default()
     }
 
+    #[inline]
     fn encode(&self, buf: &mut Vec<u8>) -> IsNull {
         self.as_ref().map_or(IsNull::Yes, |value| value.encode(buf))
     }

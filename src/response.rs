@@ -396,7 +396,8 @@ fn empty(body: &[u8]) -> Option<()> {
 impl<S> Frontend for Response<'_, S> {
     type Buf = Vec<u8>;
 
+    #[inline]
     fn with_buf<R>(&mut self, write: impl FnOnce(&mut Vec<u8>) -> R) -> R {
-        write(self.buf())
+        self.conn.with_buf(write)
     }
 }

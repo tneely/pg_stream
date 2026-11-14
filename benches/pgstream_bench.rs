@@ -161,6 +161,14 @@ fn encode(c: &mut Criterion) {
         })
     });
 
+    group.bench_function("bind_eight_params_of_one_type", |b| {
+        let ids = [1i64, 2, 3, 4, 5, 6, 7, 8];
+        b.iter(|| {
+            buf.clear();
+            buf.bind("portal", "statement", black_box(&ids[..]), Format::Binary);
+        })
+    });
+
     // The same messages written into a slice, which cannot grow.
     let mut storage = vec![0; 4096];
 
@@ -342,10 +350,33 @@ fn send(c: &mut Criterion) {
         })
     });
 
+    // Messages encoded elsewhere and appended as bytes, as a task does that
+    // owns the connection on behalf of others.
+    let mut encoded = Vec::new();
+    (0..100).for_each(|id| lookup(&mut encoded, id));
+    group.bench_function("pipeline_of_100_cycles_appended", |b| {
+        b.iter(|| {
+            conn.buf().extend_from_slice(black_box(&encoded));
+            block_on(conn.flush()).unwrap();
+        })
+    });
+
     group.bench_function("copy_of_100_rows", |b| {
         b.iter(|| {
             for _ in 0..100 {
                 conn.copy_data(black_box(b"1\tsome text for a row\t2026-11-12\n"));
+            }
+            block_on(conn.flush()).unwrap();
+        })
+    });
+
+    // A batch larger than the room a connection keeps while it is idle.
+    let chunk = vec![b'x'; 8 * 1024];
+    group.throughput(Throughput::Bytes(128 * chunk.len() as u64));
+    group.bench_function("copy_of_1MiB", |b| {
+        b.iter(|| {
+            for _ in 0..128 {
+                conn.copy_data(black_box(&chunk));
             }
             block_on(conn.flush()).unwrap();
         })

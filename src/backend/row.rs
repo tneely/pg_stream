@@ -32,12 +32,14 @@ impl<'a> DataRow<'a> {
 
     #[inline]
     pub(crate) fn try_parse(body: &'a [u8]) -> Option<Self> {
-        let mut cursor = Cursor(body);
-        let len = cursor.u16()?;
-        for _ in 0..len {
-            next_value(&mut cursor.0)?;
-        }
-        cursor.is_empty().then_some(Self { len, body })
+        let (len, _) = body.split_first_chunk::<COUNT_LEN>()?;
+        let len = u16::from_be_bytes(*len);
+        let row = Self { len, body };
+        // A row is whole if it holds as many values as it says it does, and
+        // nothing after them.
+        let mut values = row.iter();
+        let whole = values.by_ref().count() == row.len() && values.rest.is_empty();
+        whole.then_some(row)
     }
 
     /// The raw message body: the number of values, then each value behind
@@ -183,6 +185,7 @@ impl<'a> RowDescription<'a> {
     }
 
     /// The columns in order.
+    #[inline]
     pub fn iter(&self) -> Fields<'a> {
         let (rest, remaining) = (&self.body[COUNT_LEN..], self.len);
         Fields { rest, remaining }
@@ -190,6 +193,15 @@ impl<'a> RowDescription<'a> {
 }
 
 impl<'a> IntoIterator for RowDescription<'a> {
+    type Item = Field<'a>;
+    type IntoIter = Fields<'a>;
+
+    fn into_iter(self) -> Fields<'a> {
+        self.iter()
+    }
+}
+
+impl<'a> IntoIterator for &RowDescription<'a> {
     type Item = Field<'a>;
     type IntoIter = Fields<'a>;
 
@@ -227,6 +239,7 @@ pub struct Field<'a> {
 /// format code.
 const FIELD_TAIL_LEN: usize = 4 + 2 + 4 + 2 + 4 + 2;
 
+#[inline]
 fn next_field<'a>(rest: &mut &'a [u8]) -> Option<Field<'a>> {
     let mut cursor = Cursor(rest);
     let name = text(cursor.cstr()?);
@@ -255,6 +268,7 @@ pub struct Fields<'a> {
 impl<'a> Iterator for Fields<'a> {
     type Item = Field<'a>;
 
+    #[inline]
     fn next(&mut self) -> Option<Field<'a>> {
         self.remaining = self.remaining.checked_sub(1)?;
         next_field(&mut self.rest)

@@ -29,6 +29,7 @@ use pg_stream::{Format, Frontend, params, startup::Startup};
 #[tokio::main]
 async fn main() -> pg_stream::Result<()> {
     let stream = tokio::net::TcpStream::connect("localhost:5432").await?;
+    stream.set_nodelay(true)?;
     let mut startup = Startup::new("postgres");
     startup.database("mydb").password("secret");
     let (mut conn, session) = startup.connect(stream).await?;
@@ -57,6 +58,8 @@ async fn main() -> pg_stream::Result<()> {
 ```
 
 Nothing above flushes: reading sends what is queued.
+
+`set_nodelay` turns off Nagle's algorithm, as libpq does. With it on, a request that goes out in more than one write, such as COPY data flushed as it is produced, waits for the server to acknowledge the first, and a server with nothing to say takes 40 ms or more to do that.
 
 ## Pipelining
 
@@ -104,6 +107,20 @@ buf.bind("", "", params![42i32, &name, blob, Option::<i64>::None], Format::Text)
 
 `Param` is implemented for the integer and float types, `bool`, `str`, `String`, `[u8]`, `[u8; N]`, `Vec<u8>`, `bytes::Bytes`, `Option<T>`, and `&T` for any `T` that has it. Implement it yourself for custom encodings.
 
+Numbers are sent in binary, so the Rust type has to be the SQL type of the parameter: `i16` for `int2`, `i32` for `int4`, `i64` for `int8`, `f32` for `float4` and `f64` for `float8`. The server refuses a value of another width, and reads one of the same width as the type it expects. Send a number as a string to have the server convert it.
+
+A slice or array of values of one type is a parameter list as well, with no macro needed:
+
+```rust
+use pg_stream::{Format, Frontend};
+
+let mut buf = Vec::new();
+let ids = vec![7i64, 8, 9];
+
+buf.bind("", "by_ids", &ids[..], Format::Binary);
+buf.bind("", "by_names", ["Ada", "Grace"], Format::Text);
+```
+
 To skip the trait and write values in place, use `params_with`. You declare the formats, and each value's length is filled in after it is written, so nothing is measured or buffered first:
 
 ```rust
@@ -122,7 +139,7 @@ buf.bind("", "stmt", params, Format::Binary);
 
 ## Buffers
 
-`Frontend` writes to more than a connection. It is implemented for anything that is a `frontend::Buffer`: a `Vec<u8>`, a `std::io::Cursor` over a byte slice, or a type of your own with four methods. A plain `&mut [u8]` works too, and is shortened to what is left of it, as it is by `std::io::Write`:
+`Frontend` writes to more than a connection. It is implemented for anything that is a `frontend::Buffer`: a `Vec<u8>`, a `bytes::BytesMut`, a `std::io::Cursor` over a byte slice, or a type of your own with four methods. A plain `&mut [u8]` works too, and is shortened to what is left of it, as it is by `std::io::Write`:
 
 ```rust
 use pg_stream::Frontend;
@@ -334,6 +351,7 @@ TLS is negotiated before the session starts: `request_tls` asks the server, and 
 use pg_stream::{request_tls, startup::Startup};
 
 let mut tcp = tokio::net::TcpStream::connect("localhost:5432").await?;
+tcp.set_nodelay(true)?;
 if !request_tls(&mut tcp).await? {
     return Err(std::io::Error::other("server does not support TLS").into());
 }
@@ -361,6 +379,7 @@ A `Connection` runs over anything that implements `Transport`: three poll functi
   use pg_stream::{Blocking, Frontend, block_on, startup::Startup};
 
   let stream = std::net::TcpStream::connect("localhost:5432")?;
+  stream.set_nodelay(true)?;
   let (mut conn, _) = block_on(Startup::new("postgres").connect(Blocking(stream)))?;
   conn.query("SELECT 1");
   block_on(conn.response().finish())?;
@@ -389,11 +408,11 @@ Against 0.2.1, measured with criterion on one machine, reading from and writing 
 | Workload | 0.2.1 | 0.3.0 |
 | --- | --- | --- |
 | Encode Parse, Bind, Execute, Sync | 146 ns | 26 ns |
-| Encode Bind with eight mixed parameters | 202 ns | 68 ns |
-| Receive 100 one-column rows | 5.0 µs | 1.1 µs |
-| Receive 1000 ten-column rows, reading every value | 210 µs | 46 µs |
-| The same, as owned frames | 210 µs | 66 µs |
-| The same, as owned frames in batches | 210 µs | 52 µs |
+| Encode Bind with eight mixed parameters | 202 ns | 67 ns |
+| Receive 100 one-column rows | 5.0 µs | 1.0 µs |
+| Receive 1000 ten-column rows, reading every value | 210 µs | 42 µs |
+| The same, as owned frames | 210 µs | 61 µs |
+| The same, as owned frames in batches | 210 µs | 49 µs |
 
 `cargo bench` runs the current set.
 

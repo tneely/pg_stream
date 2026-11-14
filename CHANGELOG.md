@@ -66,7 +66,8 @@ public item changed; the table at the end maps the 0.2 API to the new one.
   **`recv_frames`** returns every message that has arrived, up to the end of
   a cycle, as one `Frames`.
 - **`params!` macro**: builds parameter lists without per-value
-  `as &dyn Bindable` casts.
+  `as &dyn Bindable` casts. A slice or array of values of one type, such as
+  `&[i64]` or `[&str; 2]`, is a parameter list too.
 - **`params_with` / `try_params_with`** write parameter values directly into
   the message in caller-declared formats. `try_bind` rolls the message back
   if an encoder fails.
@@ -119,10 +120,10 @@ public item changed; the table at the end maps the 0.2 API to the new one.
 - **Encoding is single-pass.** Lengths are filled in after the body is
   written, so nothing is measured first. That takes a buffer whose bytes can
   be rewritten, so `Frontend` (formerly `PgProtocol`) writes to a
-  `frontend::Buffer` rather than to every `BufMut`: a `Vec<u8>`, an
-  `io::Cursor` over a byte slice, or a type of your own. It is implemented
-  for `Connection` as well, and for `&mut [u8]`, which is shortened as it is
-  written to.
+  `frontend::Buffer` rather than to every `BufMut`: a `Vec<u8>`, a
+  `BytesMut`, an `io::Cursor` over a byte slice, or a type of your own. It
+  is implemented for `Connection` as well, and for `&mut [u8]`, which is
+  shortened as it is written to.
 - **Statement/portal names are `&str`, not `Option<&str>`**. The protocol
   defines the empty string as the unnamed statement/portal, so the API now says
   the same: `conn.execute("portal", 0)` or `conn.execute("", 0)`.
@@ -174,18 +175,18 @@ writing to memory through each version's blocking I/O:
 | Workload | 0.2.1 | 0.3.0 |
 | --- | --- | --- |
 | Encode Parse, Bind, Execute, Sync | 146 ns | 26 ns |
-| Encode Bind with eight mixed parameters | 202 ns | 68 ns |
-| Receive 100 one-column rows | 5.0 µs | 1.1 µs |
-| Receive 1000 ten-column rows, reading every value | 210 µs | 46 µs |
-| The same, as owned frames | 210 µs | 66 µs |
-| The same, as owned frames in batches | 210 µs | 52 µs |
+| Encode Bind with eight mixed parameters | 202 ns | 67 ns |
+| Receive 100 one-column rows | 5.0 µs | 1.0 µs |
+| Receive 1000 ten-column rows, reading every value | 210 µs | 42 µs |
+| The same, as owned frames | 210 µs | 61 µs |
+| The same, as owned frames in batches | 210 µs | 49 µs |
 
 ### Migrating
 
 | 0.2 | 0.3 |
 | --- | --- |
 | `PgConnection` | `Connection` |
-| `PgProtocol` on any `BufMut` | `Frontend` on `Connection`, `Vec<u8>`, `&mut [u8]` and any `frontend::Buffer` |
+| `PgProtocol` on any `BufMut` | `Frontend` on `Connection`, `Vec<u8>`, `BytesMut`, `&mut [u8]` and any `frontend::Buffer` |
 | `None` for the unnamed statement or portal | `""` |
 | `conn.recv()` returning `PgMessage` | `conn.recv()` returning `Message<'_>`, or `conn.response()` |
 | a `PgMessage` kept past the next `recv` | `conn.recv_frame()`, then `Frame::parse` |

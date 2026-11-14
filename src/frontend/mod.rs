@@ -23,6 +23,8 @@ mod params;
 
 use std::{convert::Infallible, io::Cursor};
 
+use bytes::BytesMut;
+
 pub use params::{
     Formats, IsNull, Param, ParamWriter, Params, ParamsWith, TryParamsWith, params_with,
     try_params_with,
@@ -37,9 +39,9 @@ use crate::{Format, Oid, ProtocolVersion};
 /// in once its body has been written, and a message that fails partway is
 /// removed.
 ///
-/// It is implemented for `Vec<u8>`, which grows as needed, and for a
-/// [`Cursor`] over a byte slice, which holds as much as the slice has room
-/// for. Every `Buffer` is a [`Frontend`].
+/// It is implemented for `Vec<u8>` and [`BytesMut`], which grow as needed,
+/// and for a [`Cursor`] over a byte slice, which holds as much as the slice
+/// has room for. Every `Buffer` is a [`Frontend`].
 pub trait Buffer {
     /// How many bytes have been written.
     fn written(&self) -> usize;
@@ -106,6 +108,33 @@ impl Buffer for Vec<u8> {
     #[inline]
     fn with_vec<R>(&mut self, write: impl FnOnce(&mut Vec<u8>) -> R) -> R {
         write(self)
+    }
+}
+
+impl Buffer for BytesMut {
+    #[inline]
+    fn written(&self) -> usize {
+        self.len()
+    }
+
+    #[inline]
+    fn put(&mut self, bytes: &[u8]) {
+        self.extend_from_slice(bytes);
+    }
+
+    #[inline]
+    fn patch(&mut self, at: usize, bytes: &[u8]) {
+        self[at..at + bytes.len()].copy_from_slice(bytes);
+    }
+
+    #[inline]
+    fn truncate(&mut self, len: usize) {
+        BytesMut::truncate(self, len);
+    }
+
+    #[inline]
+    fn reserve(&mut self, additional: usize) {
+        BytesMut::reserve(self, additional);
     }
 }
 
@@ -641,6 +670,28 @@ mod tests {
         assert_eq!(null, message(b'B', expected));
     }
 
+    /// A slice or array of values of one type is the list that `params!`
+    /// makes of them, and formats are taken by value or by reference.
+    #[test]
+    fn lists_of_one_type_are_parameter_lists() {
+        fn bound(params: impl Params<Error = Infallible>, formats: impl Formats) -> Vec<u8> {
+            encoded(|b| _ = b.bind("p", "s", params, formats))
+        }
+        let formats = [Format::Text, Format::Binary];
+        let expected = bound(params![1i16, 2i16], formats);
+
+        let values = [1i16, 2i16];
+        let sync: [&(dyn Param + Sync); 2] = [&1i16, &2i16];
+        let (by_reference, formats_by_reference) = (&values, &formats);
+        assert_eq!(bound(values, formats), expected);
+        assert_eq!(bound(by_reference, formats_by_reference), expected);
+        assert_eq!(bound(&values[..], &formats[..]), expected);
+        assert_eq!(bound(sync, formats), expected);
+
+        let names = bound(["a", "bc"], Format::Text);
+        assert_eq!(names, bound(params!["a", "bc"], Format::Text));
+    }
+
     #[test]
     fn every_built_in_parameter_type_encodes() {
         let string = String::from("s");
@@ -784,6 +835,10 @@ mod tests {
         let mut ring = Ring::default();
         everything(&mut ring);
         assert_eq!(ring.0, vec);
+
+        let mut bytes = BytesMut::new();
+        everything(&mut bytes);
+        assert_eq!(bytes, vec);
     }
 
     #[test]

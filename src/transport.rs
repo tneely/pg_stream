@@ -19,6 +19,11 @@ use crate::{Error, Frontend, Result, backend::BackendKey};
 /// Both directions are polled from the same task, and each must be able to
 /// make progress while the other is pending. A connection relies on that to
 /// keep taking replies while the server is slow to take requests.
+///
+/// A TCP stream should have `TCP_NODELAY` set, as libpq sets it. A connection
+/// writes each batch of messages at once, which leaves Nagle's algorithm
+/// nothing to gather, and a wait of 40 ms or more to add whenever a request
+/// takes a second write.
 pub trait Transport {
     /// Reads into `buf`, which is never empty, returning how many bytes were
     /// read. Zero means the peer closed the stream.

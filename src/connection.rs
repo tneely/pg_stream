@@ -521,8 +521,9 @@ impl<S: Transport> Connection<S> {
 impl<S> Frontend for Connection<S> {
     type Buf = Vec<u8>;
 
+    #[inline]
     fn with_buf<R>(&mut self, write: impl FnOnce(&mut Vec<u8>) -> R) -> R {
-        write(self.buf())
+        self.outbox.encode(write, |code| self.state.queued(code))
     }
 }
 

@@ -121,6 +121,7 @@ fn row_description() {
     };
     assert_eq!(columns.iter().collect::<Vec<_>>(), [id, name]);
     assert_eq!(columns.into_iter().count(), 2);
+    assert_eq!((&columns).into_iter().count(), 2);
     assert_eq!(format!("{:?}", columns.iter()), format!("{columns:?}"));
     assert_eq!(RowDescription::parse(columns.as_bytes()), Ok(columns));
 

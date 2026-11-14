@@ -5,33 +5,40 @@
 pub(super) struct Cursor<'a>(pub &'a [u8]);
 
 impl<'a> Cursor<'a> {
+    #[inline]
     pub fn array<const N: usize>(&mut self) -> Option<[u8; N]> {
         let (head, rest) = self.0.split_first_chunk::<N>()?;
         self.0 = rest;
         Some(*head)
     }
 
+    #[inline]
     pub fn u8(&mut self) -> Option<u8> {
         self.array::<1>().map(|[b]| b)
     }
 
+    #[inline]
     pub fn u16(&mut self) -> Option<u16> {
         self.array().map(u16::from_be_bytes)
     }
 
+    #[inline]
     pub fn i16(&mut self) -> Option<i16> {
         self.array().map(i16::from_be_bytes)
     }
 
+    #[inline]
     pub fn u32(&mut self) -> Option<u32> {
         self.array().map(u32::from_be_bytes)
     }
 
+    #[inline]
     pub fn i32(&mut self) -> Option<i32> {
         self.array().map(i32::from_be_bytes)
     }
 
     /// Reads up to a NUL terminator and consumes it.
+    #[inline]
     pub fn cstr(&mut self) -> Option<&'a [u8]> {
         let end = self.0.iter().position(|&b| b == 0)?;
         let (head, rest) = self.0.split_at(end);
@@ -39,6 +46,7 @@ impl<'a> Cursor<'a> {
         Some(head)
     }
 
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
@@ -47,6 +55,7 @@ impl<'a> Cursor<'a> {
 /// Decodes server text. Postgres sends text in the session's
 /// `client_encoding`; anything from the first byte that is not valid UTF-8
 /// onward is dropped.
+#[inline]
 pub(super) fn text(bytes: &[u8]) -> &str {
     match std::str::from_utf8(bytes) {
         Ok(s) => s,
